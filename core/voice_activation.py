@@ -695,6 +695,7 @@ class VoiceActivationManager:
         get_app_state_summary: Optional[Callable[[], Dict[str, Any]]] = None,
         response_display_duration: float = 6.0,
         on_wake_callback: Optional[Callable[[], None]] = None,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self.sample_rate: int = sample_rate
         self.chunk_size: int = chunk_size
@@ -709,6 +710,7 @@ class VoiceActivationManager:
         self.tts: LocalTextToSpeech = tts or LocalTextToSpeech(enabled=enable_tts)
         self.get_app_state_summary: Optional[Callable[[], Dict[str, Any]]] = get_app_state_summary
         self.response_display_duration: float = response_display_duration
+        self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
 
         self._has_permission: bool = permission_granted
         self._state: VoiceState = VoiceState.STANDBY if permission_granted else VoiceState.DISABLED
@@ -840,13 +842,15 @@ class VoiceActivationManager:
             self.grant_permission()
             return True
 
-    def trigger_wake_word(self) -> None:
+    def trigger_wake_word(self, timestamp: Optional[float] = None) -> None:
         """Manually triggers wake-word detection (used for simulation and tests)."""
         with self._lock:
             if not self._has_permission:
                 return
             self._state = VoiceState.WAKE_DETECTED
-            self._capture_start_time = time.monotonic()
+            now = self._clock() if timestamp is None else timestamp
+            self._capture_start_time = now
+            self._current_frame_time = now
             self._captured_chunks.clear()
             self._has_speech_started = False
             self._speech_ended = False
@@ -895,7 +899,7 @@ class VoiceActivationManager:
         Called once per frame in the main application loop.
         Manages capture countdown timers, async state advancement, and response display.
         """
-        now = time.monotonic() if current_timestamp is None else current_timestamp
+        now = self._clock() if current_timestamp is None else current_timestamp
 
         with self._lock:
             if not self._has_permission:
@@ -1142,7 +1146,7 @@ class VoiceActivationManager:
             print("[Voice Debug] STT unavailable: whisper.cpp binary or ggml-base.en.bin model missing.")
             with self._lock:
                 self._state = VoiceState.TIMEOUT
-                self._timeout_start_time = time.monotonic()
+                self._timeout_start_time = self._clock()
                 self._timeout_label = "STT UNAVAILABLE (whisper.cpp missing)"
             return
 
@@ -1156,7 +1160,7 @@ class VoiceActivationManager:
             print("[Voice Debug] STT returned empty or None transcript. State -> TIMEOUT.")
             with self._lock:
                 self._state = VoiceState.TIMEOUT
-                self._timeout_start_time = time.monotonic()
+                self._timeout_start_time = self._clock()
                 self._timeout_label = "LISTENING TIMEOUT (No Speech Detected)"
             return
 
@@ -1207,7 +1211,7 @@ class VoiceActivationManager:
                 print(f"[Voice Debug] Callback ignored: state was {self._state.value} (expected THINKING/TRANSCRIBING).")
                 return
             self._latest_response = response
-            self._response_start_time = time.monotonic()
+            self._response_start_time = self._clock()
 
             if self.tts.enabled and self.tts.is_available and speech_text:
                 self._state = VoiceState.SPEAKING
@@ -1223,7 +1227,7 @@ class VoiceActivationManager:
         with self._lock:
             if self._state == VoiceState.SPEAKING:
                 self._state = VoiceState.RESPONDING
-                self._response_start_time = time.monotonic()
+                self._response_start_time = self._clock()
             self._wake_detector.reset()
 
     def ask_question_async(self, question: str) -> None:
@@ -1255,7 +1259,7 @@ class VoiceActivationManager:
         with self._lock:
             self._state = VoiceState.RESPONDING
             self._latest_response = resp
-            self._response_start_time = time.monotonic()
+            self._response_start_time = self._clock()
         return resp
 
     # -------------------------------------------------------------------------
@@ -1266,7 +1270,7 @@ class VoiceActivationManager:
         Directly feeds an audio chunk into the wake-word engine.
         Allows deterministic offline testing without requiring a physical microphone.
         """
-        now = time.monotonic() if timestamp is None else timestamp
+        now = self._clock() if timestamp is None else timestamp
         with self._lock:
             if not self._has_permission:
                 return False
@@ -1301,7 +1305,7 @@ class VoiceActivationManager:
                 detected = self._wake_detector.process_chunk(chunk)
                 if detected:
                     self._state = VoiceState.WAKE_DETECTED
-                    self._capture_start_time = now if timestamp is not None else (self._current_frame_time if self._current_frame_time is not None else time.monotonic())
+                    self._capture_start_time = now if timestamp is not None else (self._current_frame_time if self._current_frame_time is not None else self._clock())
                     self._captured_chunks.clear()
                     self._has_speech_started = False
                     self._speech_ended = False

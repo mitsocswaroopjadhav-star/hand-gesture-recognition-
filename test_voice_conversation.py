@@ -494,6 +494,11 @@ class TestVoiceConversation(unittest.TestCase):
         Wake detection -> audio capture in WAKE_DETECTED/CAPTURING_QUERY ->
         transcription -> LLMAssistant async request -> callback -> HUD response.
         """
+        sim_time = [200.0]
+
+        def test_clock() -> float:
+            return sim_time[0]
+
         transcriber = LocalSpeechTranscriber()
         transcriber.simulate_transcription("how do i unlock")
 
@@ -508,38 +513,40 @@ class TestVoiceConversation(unittest.TestCase):
             llm_assistant=assistant,
             enable_tts=False,
             get_app_state_summary=lambda: self.app_state,
+            clock=test_clock,
         )
 
         try:
             # 1. Trigger wake word
-            manager.trigger_wake_word()
+            t0 = sim_time[0]
+            manager.trigger_wake_word(timestamp=t0)
             self.assertEqual(manager.state, VoiceState.WAKE_DETECTED)
 
             # 2. Feed audio chunks immediately (even during WAKE_DETECTED)
             chunk = np.ones(1024, dtype=np.float32) * 0.05
             for _ in range(10):
-                manager.feed_audio(chunk)
+                manager.feed_audio(chunk, timestamp=t0)
 
             self.assertGreaterEqual(len(manager._captured_chunks), 10)
 
             # 3. Update frame to start CAPTURING_QUERY
-            t0 = 200.0
             st_cap = manager.update(current_timestamp=t0)
             self.assertEqual(st_cap.state, VoiceState.CAPTURING_QUERY)
 
             # Feed more chunks
             for _ in range(5):
-                manager.feed_audio(chunk)
+                manager.feed_audio(chunk, timestamp=t0)
 
             # 4. Finalize capture at timeout (2.0s)
-            st_trans = manager.update(current_timestamp=t0 + 2.1)
+            sim_time[0] = t0 + 2.1
+            st_trans = manager.update(current_timestamp=sim_time[0])
             self.assertEqual(st_trans.state, VoiceState.TRANSCRIBING)
 
             # 5. Wait for async QA callback
             resp_received = False
             for _ in range(40):
                 time.sleep(0.05)
-                st = manager.update(current_timestamp=time.monotonic())
+                st = manager.update(current_timestamp=sim_time[0])
                 if st.state == VoiceState.RESPONDING:
                     resp_received = True
                     self.assertIsNotNone(st.response_text)
