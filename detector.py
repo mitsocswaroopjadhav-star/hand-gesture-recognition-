@@ -35,9 +35,11 @@ _CONNECTION_COLOR = (0, 255, 0)     # Green lines for connections
 _LANDMARK_RADIUS = 4                # Radius of each landmark dot
 _CONNECTION_THICKNESS = 2           # Thickness of each connection line
 
+from core.paths import get_resource_path
+
 # Official MediaPipe Hand Landmarker model URL
 _MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-_MODEL_PATH = "hand_landmarker.task"
+_MODEL_PATH = get_resource_path("hand_landmarker.task")
 
 
 def _ensure_model_exists():

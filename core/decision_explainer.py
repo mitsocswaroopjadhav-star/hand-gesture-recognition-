@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 from core.action_executor import ActionReason, ActionResult
 from core.activation_state import ActivationResult, SystemState
@@ -47,6 +47,8 @@ from core.context_manager import Context
 from core.intent_engine import Intent, IntentReason, IntentResult
 from core.swipe_detector import SwipeDirection, SwipeResult
 from core.temporal_filter import ConfirmationStatus, TemporalFilterResult
+from core.llm_assistant import ExplanationResponse, LLMAssistant
+from core.telemetry_aggregator import StrugglePattern, StruggleType, TelemetryAggregator
 
 
 class DecisionCategory(str, Enum):
@@ -93,11 +95,13 @@ class EventSnapshot:
         intent: The Intent associated with the event (or None).
         action_name: The executed or attempted action name (or None).
         action_status: The status string associated with the action/event.
+        coaching: Optional AI coaching response explaining the event.
     """
     decision: DecisionMessage
     intent: Optional[Intent] = None
     action_name: Optional[str] = None
     action_status: str = "IDLE"
+    coaching: Optional[ExplanationResponse] = None
 
 
 # Semantic BGR Color Palette
@@ -111,8 +115,299 @@ COLOR_GRAY: Tuple[int, int, int] = (180, 180, 180)   # Idle / Neutral
 
 class DecisionExplainer:
     """
-    Deterministic rule-based decision explanation engine.
+    Deterministic rule-based decision explanation engine, enhanced with
+    intelligent, asynchronous LLM coaching feedback.
     """
+
+    def __init__(
+        self,
+        llm_assistant: Optional[LLMAssistant] = None,
+        telemetry_aggregator: Optional[TelemetryAggregator] = None,
+    ) -> None:
+        self._llm_assistant = llm_assistant
+        self._telemetry_aggregator: TelemetryAggregator = (
+            telemetry_aggregator if telemetry_aggregator is not None else TelemetryAggregator()
+        )
+        self._explanation_cache: Dict[str, ExplanationResponse] = {}
+        self._latest_coaching: Optional[ExplanationResponse] = None
+        self._pending_cache_key: Optional[str] = None
+        self._is_loading_coaching: bool = False
+        self._toast_message: Optional[str] = None
+        self._toast_expires_at: float = 0.0
+        self._toast_duration: float = 4.0
+
+    @property
+    def telemetry_aggregator(self) -> TelemetryAggregator:
+        """Returns the internal bounded telemetry aggregator."""
+        return self._telemetry_aggregator
+
+    @property
+    def llm_assistant(self) -> LLMAssistant:
+        """Lazily instantiates LLMAssistant if not explicitly injected."""
+        if self._llm_assistant is None:
+            self._llm_assistant = LLMAssistant()
+        return self._llm_assistant
+
+    @property
+    def is_loading_coaching(self) -> bool:
+        """Indicates whether an asynchronous coaching request is currently in flight."""
+        return self._is_loading_coaching
+
+    @property
+    def provider_status(self) -> str:
+        """Returns the active provider configuration status."""
+        if self._llm_assistant and self._llm_assistant.has_active_remote:
+            return "ONLINE_GEMINI"
+        return "OFFLINE_HEURISTIC"
+
+    def _compute_cache_key(
+        self,
+        category: str,
+        text: str,
+        state: str,
+        context: str,
+        raw_gesture: Optional[str],
+        confidence: float,
+        effective_threshold: float,
+    ) -> str:
+        # 5% confidence buckets to avoid jitter cache misses
+        bucketed_conf = int(confidence * 20) * 5
+        bucketed_thresh = int(effective_threshold * 100)
+        return f"{category}|{text}|{state}|{context}|{raw_gesture or 'None'}|{bucketed_conf}|{bucketed_thresh}"
+
+    def explain_with_llm(
+        self,
+        decision_msg: DecisionMessage,
+        state: SystemState,
+        context: Context,
+        raw_gesture: Optional[str] = None,
+        confidence: float = 0.0,
+        effective_threshold: float = 0.80,
+        hold_duration: float = 0.0,
+        target_hold: float = 0.5,
+        is_swipe: bool = False,
+    ) -> ExplanationResponse:
+        """
+        Synchronously resolves a coaching explanation, utilizing semantic caching.
+        """
+        key = self._compute_cache_key(
+            category=decision_msg.category.value,
+            text=decision_msg.text,
+            state=state.value,
+            context=context.value,
+            raw_gesture=raw_gesture,
+            confidence=confidence,
+            effective_threshold=effective_threshold,
+        )
+        if key in self._explanation_cache:
+            self._latest_coaching = self._explanation_cache[key]
+            return self._latest_coaching
+
+        explanation = self.llm_assistant.explain_decision(
+            decision_category=decision_msg.category.value,
+            decision_text=decision_msg.text,
+            state=state.value,
+            context=context.value,
+            raw_gesture=raw_gesture,
+            confidence=confidence,
+            effective_threshold=effective_threshold,
+            hold_duration=hold_duration,
+            target_hold=target_hold,
+            is_swipe=is_swipe,
+        )
+        self._explanation_cache[key] = explanation
+        self._latest_coaching = explanation
+        return explanation
+
+    def explain_snapshot_with_llm(
+        self,
+        snapshot: EventSnapshot,
+        context: Context,
+        state: SystemState = SystemState.ACTIVE,
+    ) -> ExplanationResponse:
+        """Convenience method to resolve coaching explanation for an EventSnapshot."""
+        return self.explain_with_llm(
+            decision_msg=snapshot.decision,
+            state=state,
+            context=context,
+            raw_gesture=snapshot.action_name,
+        )
+
+    def request_coaching_async(
+        self,
+        decision_msg: DecisionMessage,
+        state: SystemState,
+        context: Context,
+        raw_gesture: Optional[str] = None,
+        confidence: float = 0.0,
+        effective_threshold: float = 0.80,
+        hold_duration: float = 0.0,
+        target_hold: float = 0.5,
+        is_swipe: bool = False,
+        callback: Optional[Callable[[ExplanationResponse], None]] = None,
+    ) -> None:
+        """
+        Dispatches coaching retrieval asynchronously to avoid blocking the webcam processing loop.
+        Immediately returns cached response if available.
+        """
+        key = self._compute_cache_key(
+            category=decision_msg.category.value,
+            text=decision_msg.text,
+            state=state.value,
+            context=context.value,
+            raw_gesture=raw_gesture,
+            confidence=confidence,
+            effective_threshold=effective_threshold,
+        )
+        if key in self._explanation_cache:
+            cached = self._explanation_cache[key]
+            self._latest_coaching = cached
+            if callback:
+                callback(cached)
+            return
+
+        if self._pending_cache_key == key:
+            return  # Query already in flight for this exact event
+
+        self._pending_cache_key = key
+        self._is_loading_coaching = True
+
+        def _on_done(res: Optional[ExplanationResponse]) -> None:
+            self._is_loading_coaching = False
+            self._pending_cache_key = None
+            if res is not None:
+                self._explanation_cache[key] = res
+                self._latest_coaching = res
+                if callback:
+                    callback(res)
+            elif callback:
+                fallback = self.llm_assistant.offline_provider.explain_decision(
+                    decision_category=decision_msg.category.value,
+                    decision_text=decision_msg.text,
+                    state=state.value,
+                    context=context.value,
+                    raw_gesture=raw_gesture,
+                    confidence=confidence,
+                    effective_threshold=effective_threshold,
+                    hold_duration=hold_duration,
+                    target_hold=target_hold,
+                    is_swipe=is_swipe,
+                )
+                self._explanation_cache[key] = fallback
+                self._latest_coaching = fallback
+                callback(fallback)
+
+        self.llm_assistant.query_async(
+            self.llm_assistant.explain_decision,
+            decision_category=decision_msg.category.value,
+            decision_text=decision_msg.text,
+            state=state.value,
+            context=context.value,
+            raw_gesture=raw_gesture,
+            confidence=confidence,
+            effective_threshold=effective_threshold,
+            hold_duration=hold_duration,
+            target_hold=target_hold,
+            is_swipe=is_swipe,
+            callback=_on_done,
+        )
+
+    def get_latest_coaching(self) -> Optional[ExplanationResponse]:
+        """Returns the most recently resolved coaching response."""
+        return self._latest_coaching
+
+    def record_interaction(
+        self,
+        timestamp: float,
+        decision_msg: DecisionMessage,
+        gesture: Optional[str] = None,
+        confidence: float = 0.0,
+        effective_threshold: float = 0.80,
+        hold_duration: float = 0.0,
+        target_hold: float = 0.50,
+        reason: str = "",
+        context: Context = Context.MEDIA,
+        is_swipe: bool = False,
+        state: SystemState = SystemState.LOCKED,
+    ) -> None:
+        """Records telemetry into the bounded ring buffer."""
+        state_str = state.value if isinstance(state, SystemState) else str(state)
+        self._telemetry_aggregator.record(
+            timestamp=timestamp,
+            category=decision_msg.category.value,
+            gesture=gesture,
+            confidence=confidence,
+            effective_threshold=effective_threshold,
+            hold_duration=hold_duration,
+            target_hold=target_hold,
+            reason=reason or decision_msg.text,
+            context=context.value,
+            is_swipe=is_swipe,
+            state=state_str,
+        )
+
+    def check_proactive_coaching(
+        self,
+        current_timestamp: float,
+        context: Context = Context.MEDIA,
+    ) -> Optional[str]:
+        """
+        Evaluates recent telemetry for interaction struggle patterns.
+        If a pattern is detected, immediately triggers an asynchronous coaching
+        request and surfaces a temporary toast notification.
+        """
+        pattern = self._telemetry_aggregator.detect_struggle(current_timestamp)
+        if not pattern:
+            return None
+
+        # Immediate grounded offline coaching response
+        offline_coach = self.llm_assistant.offline_provider.coach_struggle(pattern, context)
+        self._toast_message = offline_coach.coaching_tip
+        self._toast_expires_at = current_timestamp + self._toast_duration
+
+        # Background async refinement if remote LLM is available
+        def _on_async_coach(res: Optional[ExplanationResponse]) -> None:
+            if res and res.coaching_tip and current_timestamp < self._toast_expires_at:
+                self._toast_message = res.coaching_tip
+
+        self.llm_assistant.query_async(
+            self.llm_assistant.coach_struggle,
+            pattern=pattern,
+            context=context,
+            callback=_on_async_coach,
+        )
+        return self._toast_message
+
+    def get_active_toast(self, current_timestamp: float) -> Optional[Tuple[str, float]]:
+        """
+        Returns (toast_message, remaining_ratio) if a proactive coaching toast is active.
+        Ratio ranges from 1.0 (fresh) down to 0.0 (expired).
+        """
+        if self._toast_message and current_timestamp < self._toast_expires_at:
+            remaining = self._toast_expires_at - current_timestamp
+            ratio = max(0.0, min(1.0, remaining / self._toast_duration))
+            return (self._toast_message, ratio)
+        self._toast_message = None
+        return None
+
+    def clear_active_toast(self) -> None:
+        """Clears any currently active proactive coaching toast."""
+        self._toast_message = None
+        self._toast_expires_at = 0.0
+
+    def clear_cache(self) -> None:
+        """Clears the semantic coaching cache and telemetry buffer."""
+        self._explanation_cache.clear()
+        self._pending_cache_key = None
+        self._is_loading_coaching = False
+        self._telemetry_aggregator.clear()
+        self._toast_message = None
+        self._toast_expires_at = 0.0
+
+    def close(self) -> None:
+        """Shuts down the internal LLMAssistant if created internally."""
+        if self._llm_assistant is not None:
+            self._llm_assistant.close()
 
     def explain(
         self,

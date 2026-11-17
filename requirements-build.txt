@@ -1,0 +1,7 @@
+# IntentSense Build & Packaging Dependencies
+# For generating standalone macOS .app bundles on Apple Silicon
+
+-r requirements.txt
+pyinstaller>=6.4.0
+setuptools>=69.0.0
+wheel>=0.42.0

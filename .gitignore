@@ -1,6 +1,73 @@
+# ==============================================================================
+# IntentSense .gitignore
+# ==============================================================================
+
+# Python Environments & Bytecode
 venv/
 .venv/
+env/
+ENV/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# macOS System Files
 .DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Secrets, Environment & API Keys
 .env
+.env.*
+!.env.example
+
+# Whisper.cpp Source Submodule & Build Binaries
+# (Built locally via scripts/setup_whisper.sh)
+whisper.cpp/
+bin/whisper-cli
+bin/main
+bin/lib*.dylib
+bin/*.dylib
+
+# Large Deep Learning Model Files (>100MB)
+# (Downloaded locally via scripts/setup_whisper.sh)
+models/*.bin
+models/ggml-*.bin
+models/whisper-*.bin
+*.bin
+
+# User Personal Profiles & Custom Gestures
+# (Stored in ~/Library/Application Support/IntentSense at runtime)
+models/custom_gestures.json
+models/temp_custom_*.json
+custom_gestures.json
+*.tmp
+
+# Audio Recordings & Scratch Wave Files
+*.wav
+*.mp3
+*.m4a
+*.ogg
+intentsense_stt_*.wav
+
+# PyInstaller & Application Build Artifacts
+build/
+dist/
+*.app/
+*.dmg
+*.pkg
+*.zip
+*.spec.bak
+
+# IDE & Editor Configurations
+.vscode/
+.idea/
+*.swp
+*.swo

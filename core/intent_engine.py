@@ -455,3 +455,68 @@ class IntentEngine:
             accepted=True,
             reason=IntentReason.CONFIRMED,
         )
+
+    def process_typed_intent(
+        self,
+        command_intent: Optional[Intent],
+        is_active: bool,
+        target_context: Optional[Union[Context, str]] = None,
+        confidence: float = 1.0,
+    ) -> IntentResult:
+        """
+        Safely validates a typed/parsed natural language Intent through the safety engine.
+
+        Safety Rules:
+        1. System State: Must be ACTIVE. If LOCKED, command is suppressed with SYSTEM_LOCKED.
+        2. Intent Validity: Must be a verified, recognized Intent enum instance.
+        3. Context: Evaluates under target_context (if provided) or active context.
+        """
+        if target_context is not None:
+            active_context = Context.from_value(target_context)
+        else:
+            active_context = self.context_manager.get_current_context()
+
+        # Safety Gate 1: System state must be ACTIVE
+        if not is_active:
+            return IntentResult(
+                gesture="TypedCommand",
+                intent=None,
+                context=active_context,
+                confidence=confidence,
+                accepted=False,
+                reason=IntentReason.SYSTEM_LOCKED,
+            )
+
+        # Safety Gate 2: Known Intent verification
+        if command_intent is None or not isinstance(command_intent, Intent):
+            return IntentResult(
+                gesture="TypedCommand",
+                intent=None,
+                context=active_context,
+                confidence=confidence,
+                accepted=False,
+                reason=IntentReason.UNKNOWN_GESTURE,
+            )
+
+        # Safety Gate 3: Context compatibility
+        valid_intents = set(self._mappings.get(active_context, {}).values()) | set(
+            self._swipe_mappings.get(active_context, {}).values()
+        )
+        if active_context != Context.CUSTOM and valid_intents and command_intent not in valid_intents:
+            return IntentResult(
+                gesture="TypedCommand",
+                intent=None,
+                context=active_context,
+                confidence=confidence,
+                accepted=False,
+                reason=IntentReason.NO_MAPPING,
+            )
+
+        return IntentResult(
+            gesture="TypedCommand",
+            intent=command_intent,
+            context=active_context,
+            confidence=confidence,
+            accepted=True,
+            reason=IntentReason.CONFIRMED,
+        )

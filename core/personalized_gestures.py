@@ -44,6 +44,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
+from core.paths import get_custom_gestures_path
+
 from core.context_manager import Context
 from core.intent_engine import KNOWN_GESTURES, Intent
 
@@ -311,8 +313,7 @@ class PersonalizedGestureManager:
         if profile_path is not None:
             self.profile_path = profile_path
         else:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            self.profile_path = os.path.join(base_dir, "models", "custom_gestures.json")
+            self.profile_path = get_custom_gestures_path()
 
         self._profiles: Dict[str, GestureProfile] = {}
         self.load_profiles()

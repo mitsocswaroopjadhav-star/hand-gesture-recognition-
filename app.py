@@ -60,12 +60,15 @@ import argparse
 import math
 import os
 import sys
+import textwrap
 import time
 from typing import Any, List, Optional, Sequence, Tuple
 
 import cv2
 import joblib
 import numpy as np
+
+from core.paths import get_resource_path
 
 # Ensure project root is in sys.path
 PROJECT_ROOT: str = os.path.dirname(os.path.abspath(__file__))
@@ -112,6 +115,7 @@ from core.decision_explainer import (
     DecisionMessage,
     EventSnapshot,
 )
+from core.llm_assistant import ExplanationResponse, LLMAssistant, NaturalCommandResponse
 from core.personalized_gestures import (
     ArbitrationResult,
     CustomMatchResult,
@@ -120,6 +124,16 @@ from core.personalized_gestures import (
     SUPPORTED_ACTION_MAP,
     format_enrollment_error,
     validate_enrollment_samples,
+)
+from core.onboarding import (
+    OnboardingStepId,
+    OnboardingStepResult,
+    TouchlessOnboardingController,
+)
+from core.voice_activation import (
+    VoiceActivationManager,
+    VoiceHudStatus,
+    VoiceState,
 )
 from detector import HandDetector
 from enum import Enum
@@ -134,6 +148,9 @@ class AppUIMode(str, Enum):
     MANAGE_MENU = "MANAGE_MENU"
     TEST_MODE = "TEST_MODE"
     HELP = "HELP"
+    COMMAND_BAR = "COMMAND_BAR"
+    COMMAND_CONFIRM = "COMMAND_CONFIRM"
+    ONBOARDING = "ONBOARDING"
 
 
 SUPPORTED_ACTIONS_LIST: List[Tuple[str, str]] = [
@@ -152,7 +169,7 @@ SUPPORTED_ACTIONS_LIST: List[Tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 # Constants & Configuration Defaults
 # ---------------------------------------------------------------------------
-MODEL_PATH: str = os.path.join(PROJECT_ROOT, "models", "gesture_model.pkl")
+MODEL_PATH: str = get_resource_path(os.path.join("models", "gesture_model.pkl"))
 
 CONFIDENCE_THRESHOLD: float = 0.80
 STABLE_FRAMES: int = 5
@@ -193,16 +210,17 @@ def draw_hud(
     live_mode: bool,
     swipe_status: str = "READY",
     decision: Optional[DecisionMessage] = None,
+    voice_status: Optional[VoiceHudStatus] = None,
 ) -> None:
     """
     Renders an informative real-time HUD showing state, intent, swipe, action outcome,
-    and semantic decision explanation within fixed 420x310 dimensions.
+    semantic decision explanation, and voice activation telemetry within fixed panel dimensions.
     """
     h, w = frame.shape[:2]
 
     # Semi-transparent background overlay
     overlay = frame.copy()
-    panel_w, panel_h = 420, 310
+    panel_w, panel_h = 420, 338
     cv2.rectangle(overlay, (14, 14), (14 + panel_w, 14 + panel_h), (20, 20, 20), -1)
     cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
 
@@ -297,19 +315,128 @@ def draw_hud(
     dec_text = decision.text if decision is not None else "IDLE — Waiting for hand"
     dec_color = decision.color_bgr if decision is not None else (180, 180, 180)
     cv2.putText(frame, f"DECISION    : {dec_text}", (26, y), cv2.FONT_HERSHEY_SIMPLEX, 0.43, dec_color, 1, cv2.LINE_AA)
-    y += line_h + 8
+    y += line_h + 4
+
+    # 12. LOCAL VOICE WAKE-WORD TELEMETRY
+    if voice_status is not None:
+        cv2.putText(frame, f"VOICE (V)   : {voice_status.label}", (26, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, voice_status.color_bgr, 1, cv2.LINE_AA)
+        y += line_h + 8
+    else:
+        y += 4
 
     # Controls footer inside panel
     cv2.putText(
         frame,
-        "1:Media | 2:Pres | 3:Custom | L:Lock | R:Reset | Q:Quit",
+        "1:Media | 2:Pres | 3:Custom | L:Lock | X:Explain | C:Reset Chat | V:Voice | Q:Quit",
         (26, y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.42,
+        0.37,
         (160, 160, 160),
         1,
         cv2.LINE_AA,
     )
+
+    # Visible listening indicator for active question capture or processing
+    if voice_status is not None and voice_status.is_capturing:
+        banner_w = 460
+        banner_x = (w - banner_w) // 2
+        overlay_voice = frame.copy()
+        cv2.rectangle(overlay_voice, (banner_x, 18), (banner_x + banner_w, 58), (10, 40, 10), -1)
+        cv2.addWeighted(overlay_voice, 0.85, frame, 0.15, 0, frame)
+        cv2.rectangle(frame, (banner_x, 18), (banner_x + banner_w, 58), (0, 255, 0), 2)
+        cv2.putText(
+            frame,
+            f"VOICE ACTIVE: Listening for Question ({voice_status.time_remaining:.1f}s)",
+            (banner_x + 18, 43),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (0, 255, 120),
+            2,
+            cv2.LINE_AA,
+        )
+    elif voice_status is not None and voice_status.is_processing:
+        banner_w = 480
+        banner_x = (w - banner_w) // 2
+        overlay_voice = frame.copy()
+        cv2.rectangle(overlay_voice, (banner_x, 18), (banner_x + banner_w, 58), (15, 30, 40), -1)
+        cv2.addWeighted(overlay_voice, 0.85, frame, 0.15, 0, frame)
+        cv2.rectangle(frame, (banner_x, 18), (banner_x + banner_w, 58), (0, 215, 255), 2)
+        proc_text = voice_status.label
+        cv2.putText(
+            frame,
+            proc_text[:50],
+            (banner_x + 18, 43),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (0, 215, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    elif voice_status is not None and (voice_status.state in (VoiceState.RESPONDING, VoiceState.SPEAKING)) and voice_status.response_text:
+        card_w = min(680, max(560, w - 40))
+        card_x = (w - card_w) // 2
+        card_y = 16
+
+        # Determine wrap width based on available inner card width (8.2 px per char at scale 0.44)
+        wrap_width = max(40, min(75, int((card_w - 36) / 8.2)))
+
+        q_disp = (voice_status.recognized_question or "").strip()
+        q_lines = textwrap.wrap(f'Q: "{q_disp}"', width=wrap_width) if q_disp else []
+
+        ans_disp = (voice_status.response_text or "").strip()
+        ans_lines = textwrap.wrap(f"A: {ans_disp}", width=wrap_width, subsequent_indent="   ")
+
+        line_h = 20
+        header_h = 26
+        q_h = (len(q_lines) * line_h) + (4 if q_lines else 0)
+        bottom_pad = 14
+
+        # Bound maximum card height on screen (leave room for lower HUD elements)
+        max_card_h = min(h - card_y - 20, 360)
+        available_ans_h = max(line_h * 2, max_card_h - (header_h + q_h + bottom_pad))
+        max_ans_lines = max(2, available_ans_h // line_h)
+
+        if len(ans_lines) > max_ans_lines:
+            scroll_range = len(ans_lines) - max_ans_lines
+            # Dynamic reading scroll: smoothly advance lines across total response duration
+            duration = max(0.1, getattr(voice_status, "total_duration", 15.0) or 15.0)
+            elapsed_frac = max(0.0, min(1.0, 1.0 - (voice_status.time_remaining / duration)))
+            start_idx = min(scroll_range, int(elapsed_frac * (scroll_range + 1)))
+            visible_ans_lines = ans_lines[start_idx : start_idx + max_ans_lines]
+            is_scrolling = True
+            card_h = max_card_h
+        else:
+            visible_ans_lines = ans_lines
+            is_scrolling = False
+            start_idx = 0
+            ans_h = len(visible_ans_lines) * line_h
+            card_h = max(84, header_h + q_h + ans_h + bottom_pad)
+
+        overlay_qa = frame.copy()
+        cv2.rectangle(overlay_qa, (card_x, card_y), (card_x + card_w, card_y + card_h), (18, 22, 24), -1)
+        cv2.addWeighted(overlay_qa, 0.90, frame, 0.10, 0, frame)
+
+        is_speaking = (voice_status.state == VoiceState.SPEAKING) or voice_status.is_speaking
+        border_color = (0, 255, 255) if is_speaking else (0, 255, 160)
+        cv2.rectangle(frame, (card_x, card_y), (card_x + card_w, card_y + card_h), border_color, 2)
+
+        prov = voice_status.response_provider or "Offline"
+        prefix = "AI COACH SPEAKING" if is_speaking else "VOICE ASSISTANT"
+        scroll_tag = f" [Scroll {start_idx+1}-{start_idx+len(visible_ans_lines)}/{len(ans_lines)}]" if is_scrolling else ""
+        header_text = f"{prefix} [{prov.upper()}]{scroll_tag}  ({voice_status.time_remaining:.1f}s — [ESC] to stop)"
+        cv2.putText(frame, header_text, (card_x + 16, card_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.42, border_color, 1, cv2.LINE_AA)
+
+        curr_y = card_y + 20 + 4
+        for ql in q_lines:
+            curr_y += line_h
+            cv2.putText(frame, ql, (card_x + 16, curr_y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (240, 240, 240), 1, cv2.LINE_AA)
+
+        if q_lines:
+            curr_y += 4
+
+        for al in visible_ans_lines:
+            curr_y += line_h
+            cv2.putText(frame, al, (card_x + 16, curr_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 180), 1, cv2.LINE_AA)
 
     # Active Command Banner (if recently executed)
     if last_action_event is not None:
@@ -375,6 +502,133 @@ def draw_custom_mode_banner(frame: np.ndarray, custom_count: int) -> None:
     )
 
 
+def draw_explanation_drawer(
+    frame: np.ndarray,
+    coaching: Optional[ExplanationResponse],
+    is_loading: bool,
+    provider_status: str,
+    event_text: str,
+) -> None:
+    """
+    Renders an intelligent coaching explanation drawer at the bottom of the screen.
+    Includes loading indicator, offline status, and actionable coaching tips.
+    """
+    h, w = frame.shape[:2]
+    drawer_h = 135
+    drawer_y = h - drawer_h - 14
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (14, drawer_y), (w - 14, h - 14), (20, 20, 25), -1)
+    cv2.addWeighted(overlay, 0.88, frame, 0.12, 0, frame)
+    cv2.rectangle(frame, (14, drawer_y), (w - 14, h - 14), (0, 200, 255), 2)
+
+    # Title & Provider Status Badge
+    cv2.putText(
+        frame,
+        "AI DECISION COACHING",
+        (28, drawer_y + 26),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (0, 220, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    badge_color = (0, 255, 0) if "GEMINI" in provider_status else (180, 180, 180)
+    badge_text = f"[{provider_status}]"
+    if is_loading:
+        badge_text = "[AI REASONING...]"
+        badge_color = (0, 215, 255)
+
+    cv2.putText(
+        frame,
+        badge_text,
+        (250, drawer_y + 26),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        badge_color,
+        1,
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        frame,
+        "Press [X] or [ESC] to hide",
+        (w - 220, drawer_y + 26),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (160, 160, 160),
+        1,
+        cv2.LINE_AA,
+    )
+
+    ev_disp = event_text[:85] if event_text else "Live Telemetry"
+    cv2.putText(
+        frame,
+        f"Event Trigger : {ev_disp}",
+        (28, drawer_y + 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.46,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA,
+    )
+
+    if is_loading and coaching is None:
+        cv2.putText(
+            frame,
+            "Synthesizing actionable coaching advice for your recent gesture event...",
+            (28, drawer_y + 78),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 220, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    elif coaching is not None:
+        cv2.putText(
+            frame,
+            f"Explanation   : {coaching.summary[:95]}",
+            (28, drawer_y + 74),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (240, 240, 240),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            f"Coaching Tip  : {coaching.coaching_tip[:95]}",
+            (28, drawer_y + 96),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (0, 255, 180),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            f"Next Action   : {coaching.suggested_action[:95]}",
+            (28, drawer_y + 118),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (0, 215, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    else:
+        cv2.putText(
+            frame,
+            "No coaching event recorded yet. Perform a gesture or press 'X' on any rejection.",
+            (28, drawer_y + 82),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (180, 180, 180),
+            1,
+            cv2.LINE_AA,
+        )
+
+
 def draw_modal_backdrop(
     frame: np.ndarray,
     x: int,
@@ -401,6 +655,225 @@ def draw_modal_backdrop(
             cv2.LINE_AA,
         )
         cv2.line(frame, (x + 20, y + 46), (x + w - 20, y + 46), (80, 80, 80), 1)
+
+
+def draw_coaching_toast(
+    frame: np.ndarray,
+    toast_text: str,
+    ratio: float,
+) -> None:
+    """
+    Renders an unintrusive, non-blocking proactive AI coaching toast at the bottom of the HUD.
+    Displays a modern rounded badge with live remaining progress underline.
+    Supports single-line and wrapped two-line coaching guidance without truncation.
+    """
+    h, w = frame.shape[:2]
+    is_multiline = len(toast_text) > 75
+    toast_w = min(w - 40, max(560, int(len(toast_text) * 8.5) + 120)) if not is_multiline else min(w - 40, 780)
+    toast_h = 56 if is_multiline else 42
+    toast_x = (w - toast_w) // 2
+    toast_y = h - (88 if is_multiline else 75)
+
+    # Glassmorphism backing
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (toast_x, toast_y), (toast_x + toast_w, toast_y + toast_h), (25, 25, 30), -1)
+    cv2.addWeighted(overlay, 0.90, frame, 0.10, 0, frame)
+    cv2.rectangle(frame, (toast_x, toast_y), (toast_x + toast_w, toast_y + toast_h), (0, 200, 255), 1)
+
+    # Pill badge
+    badge_w = 90
+    cv2.rectangle(frame, (toast_x + 6, toast_y + 8), (toast_x + 6 + badge_w, toast_y + toast_h - 8), (0, 180, 240), -1)
+    cv2.putText(
+        frame,
+        "AI COACH",
+        (toast_x + 14, toast_y + (32 if is_multiline else 24)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.40,
+        (10, 10, 10),
+        1,
+        cv2.LINE_AA,
+    )
+
+    # Toast text rendering (handles full message without clipping)
+    if not is_multiline:
+        cv2.putText(
+            frame,
+            toast_text,
+            (toast_x + 108, toast_y + 26),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.43,
+            (240, 240, 240),
+            1,
+            cv2.LINE_AA,
+        )
+    else:
+        # Split into two balanced lines around a sentence or space boundary
+        split_idx = toast_text.find(". ")
+        if split_idx != -1 and split_idx < 85:
+            line1 = toast_text[:split_idx + 1]
+            line2 = toast_text[split_idx + 2:]
+        else:
+            words = toast_text.split(" ")
+            mid = len(words) // 2
+            line1 = " ".join(words[:mid])
+            line2 = " ".join(words[mid:])
+
+        cv2.putText(
+            frame,
+            line1,
+            (toast_x + 108, toast_y + 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (240, 240, 240),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            line2,
+            (toast_x + 108, toast_y + 44),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (0, 220, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    # Expiry progress bar at the bottom of the toast
+    prog_w = int((toast_w - 12) * max(0.0, min(1.0, ratio)))
+    if prog_w > 0:
+        cv2.rectangle(
+            frame,
+            (toast_x + 6, toast_y + toast_h - 3),
+            (toast_x + 6 + prog_w, toast_y + toast_h - 1),
+            (0, 255, 180),
+            -1,
+        )
+
+
+def draw_onboarding_overlay(
+    frame: np.ndarray,
+    result: OnboardingStepResult,
+) -> None:
+    """
+    Renders the touchless onboarding practice screen over the camera frame.
+    Fully responsive to live gesture progression without any keyboard interaction.
+    """
+    h, w = frame.shape[:2]
+    card_w = min(w - 60, 680)
+    card_h = 280
+    card_x = (w - card_w) // 2
+    card_y = (h - card_h) // 2
+
+    # Backdrop
+    draw_modal_backdrop(
+        frame,
+        x=card_x,
+        y=card_y,
+        w=card_w,
+        h=card_h,
+        border_color=(0, 255, 200) if result.is_step_complete else (0, 215, 255),
+        title=f"TOUCHLESS PRACTICE — {result.title.upper()}",
+    )
+
+    # Step badge & target gesture
+    step_str = f"STEP {result.step_number} OF {result.total_steps}" if not result.is_all_complete else "COMPLETE"
+    cv2.putText(
+        frame,
+        step_str,
+        (card_x + 24, card_y + 65),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.46,
+        (0, 200, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        frame,
+        f"Target Pose: {result.target_gesture}",
+        (card_x + 24, card_y + 95),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    # Guidance instruction
+    cv2.putText(
+        frame,
+        result.guidance[:90],
+        (card_x + 24, card_y + 125),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        (200, 200, 200),
+        1,
+        cv2.LINE_AA,
+    )
+
+    # Live hold progress bar
+    bar_x = card_x + 24
+    bar_y = card_y + 148
+    bar_w = card_w - 48
+    bar_h = 22
+
+    # Outer bar
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
+    fill_w = int(bar_w * max(0.0, min(1.0, result.progress)))
+    fill_color = (0, 255, 0) if result.is_step_complete or result.progress >= 0.99 else (0, 220, 255)
+    if fill_w > 0:
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), fill_color, -1)
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (120, 120, 120), 1)
+
+    pct_str = f"{int(result.progress * 100)}%"
+    cv2.putText(
+        frame,
+        pct_str,
+        (bar_x + bar_w // 2 - 14, bar_y + 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        (10, 10, 10) if result.progress > 0.55 else (240, 240, 240),
+        1,
+        cv2.LINE_AA,
+    )
+
+    # Live feedback banner
+    feedback_color = (0, 255, 120) if result.is_step_complete else (0, 220, 255)
+    cv2.putText(
+        frame,
+        f"Live Feedback: {result.feedback[:80]}",
+        (card_x + 24, card_y + 195),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        feedback_color,
+        1,
+        cv2.LINE_AA,
+    )
+
+    # Safety confirmation note
+    cv2.putText(
+        frame,
+        "[SAFE PRACTICE] Real OS actions are disabled during onboarding.",
+        (card_x + 24, card_y + 225),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.40,
+        (140, 140, 140),
+        1,
+        cv2.LINE_AA,
+    )
+
+    # Footer navigation prompt
+    cv2.putText(
+        frame,
+        "Perform the gesture to advance touchlessly. Press [O] or [ESC] to exit practice.",
+        (card_x + 24, card_y + 252),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (160, 160, 160),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def draw_help_overlay(frame: np.ndarray) -> None:
@@ -439,6 +912,14 @@ def draw_help_overlay(frame: np.ndarray) -> None:
     cv2.putText(frame, "   - [M] Manage: View gestures, remap actions, re-enroll poses, or delete [D]", (mx + 24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
     y += 20
     cv2.putText(frame, "   - [T] Safe Test: Live pose distance & confidence check (Zero OS actions fired)", (mx + 24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
+    y += 20
+    cv2.putText(frame, "   - [X] AI Coaching: Toggle AI Decision Coaching drawer for instant actionable tips", (mx + 24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
+    y += 20
+    cv2.putText(frame, "   - [O] Touchless Practice: Guided interactive onboarding with zero keyboard typing", (mx + 24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
+    y += 20
+    cv2.putText(frame, "   - [V] Local Voice: Toggle microphone wake-word ('Hello Sense')", (mx + 24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
+    y += 20
+    cv2.putText(frame, "   - [:] Command Bar: Type natural language commands (e.g. 'skip song', 'volume up')", (mx + 24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
     y += 36
 
     cv2.putText(frame, "Press [ESC] or [ENTER] to close this help guide", (mx + 24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 1, cv2.LINE_AA)
@@ -834,6 +1315,236 @@ def draw_test_overlay(
     cv2.putText(frame, "Zero OS actions will execute | Press [ESC] or [Q] to exit Test Mode", (mx + 24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (180, 180, 180), 1, cv2.LINE_AA)
 
 
+def draw_command_bar_overlay(
+    frame: np.ndarray,
+    query_buffer: str,
+    error_msg: str,
+    is_loading: bool,
+    provider_status: str,
+) -> None:
+    """Renders the interactive command bar overlay."""
+    h, w = frame.shape[:2]
+    mw, mh = 680, 240
+    mx = max(20, (w - mw) // 2)
+    my = max(40, (h - mh) // 2)
+
+    draw_modal_backdrop(frame, mx, my, mw, mh, border_color=(0, 215, 255), title="NATURAL LANGUAGE COMMAND BAR")
+
+    y = my + 66
+    cv2.putText(
+        frame,
+        "Type your request in natural language (e.g. 'skip song', 'volume up', 'next slide'):",
+        (mx + 24, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA,
+    )
+    y += 32
+
+    # Text entry field
+    cv2.rectangle(frame, (mx + 20, y - 6), (mx + mw - 20, y + 36), (35, 35, 45), -1)
+    cv2.rectangle(frame, (mx + 20, y - 6), (mx + mw - 20, y + 36), (0, 215, 255), 1)
+
+    cursor_char = "_" if int(time.monotonic() * 2) % 2 == 0 else " "
+    display_text = query_buffer + cursor_char
+    cv2.putText(
+        frame,
+        f"> {display_text}",
+        (mx + 30, y + 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    y += 54
+
+    if is_loading:
+        cv2.putText(
+            frame,
+            "Interpreting command with AI assistant...",
+            (mx + 24, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (0, 220, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    elif error_msg:
+        cv2.putText(
+            frame,
+            error_msg[:75],
+            (mx + 24, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (100, 100, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    else:
+        badge_color = (0, 255, 0) if "GEMINI" in provider_status else (180, 180, 180)
+        cv2.putText(
+            frame,
+            f"Provider: [{provider_status}]  |  Safety: Validated against Intent Engine",
+            (mx + 24, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            badge_color,
+            1,
+            cv2.LINE_AA,
+        )
+
+    # Footer
+    cv2.putText(
+        frame,
+        "[ENTER] Interpret & Verify  |  [ESC] Cancel",
+        (mx + 24, my + mh - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        (160, 160, 160),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def draw_command_confirm_overlay(
+    frame: np.ndarray,
+    query_text: str,
+    parsed_command: NaturalCommandResponse,
+    state: SystemState,
+    current_context: Context,
+    live_mode: bool,
+    error_msg: str = "",
+) -> None:
+    """Renders the explicit Y/N confirmation modal before command execution."""
+    h, w = frame.shape[:2]
+    mw, mh = 680, 310
+    mx = max(20, (w - mw) // 2)
+    my = max(30, (h - mh) // 2)
+
+    border_color = (0, 255, 0) if state == SystemState.ACTIVE else (0, 140, 255)
+    draw_modal_backdrop(frame, mx, my, mw, mh, border_color=border_color, title="CONFIRM COMMAND EXECUTION")
+
+    y = my + 68
+    cv2.putText(
+        frame,
+        f"Input Query      : \"{query_text}\"",
+        (mx + 24, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    y += 28
+
+    intent_str = parsed_command.intent.value if parsed_command.intent else "NONE"
+    cv2.putText(
+        frame,
+        f"Interpreted Intent: {intent_str}",
+        (mx + 24, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (0, 255, 180),
+        2,
+        cv2.LINE_AA,
+    )
+    y += 26
+
+    cv2.putText(
+        frame,
+        f"Target Context   : {current_context.value}",
+        (mx + 24, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.46,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA,
+    )
+    y += 26
+
+    cv2.putText(
+        frame,
+        f"Explanation      : {parsed_command.explanation[:70]}",
+        (mx + 24, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        (180, 180, 180),
+        1,
+        cv2.LINE_AA,
+    )
+    y += 34
+
+    # Safety Gate Banner
+    if state == SystemState.LOCKED:
+        safety_text = "[SAFETY LOCKED] System is LOCKED. Commands are strictly suppressed."
+        safety_color = (0, 140, 255)
+    else:
+        mode_text = "LIVE OS EXECUTION" if live_mode else "SAFE DRY-RUN"
+        safety_text = f"Safety Gate Passed: System ACTIVE [{mode_text}]"
+        safety_color = (0, 255, 0) if not live_mode else (0, 165, 255)
+
+    cv2.putText(
+        frame,
+        safety_text,
+        (mx + 24, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        safety_color,
+        2,
+        cv2.LINE_AA,
+    )
+    y += 28
+
+    if error_msg:
+        cv2.putText(
+            frame,
+            error_msg[:80],
+            (mx + 24, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (100, 100, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    elif state == SystemState.LOCKED:
+        cv2.putText(
+            frame,
+            "Unlock required: Hold OpenPalm for 1.0s before commands can execute.",
+            (mx + 24, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.44,
+            (0, 165, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    else:
+        cv2.putText(
+            frame,
+            "Confirm execution of this command? [Y] Yes / [N] No",
+            (mx + 24, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 220, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    # Footer
+    cv2.putText(
+        frame,
+        "[Y] Confirm & Execute  |  [N] or [ESC] Cancel",
+        (mx + 24, my + mh - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        (160, 160, 160),
+        1,
+        cv2.LINE_AA,
+    )
+
+
 def run_smoke_test() -> bool:
     """Runs headless end-to-end component orchestration smoke test."""
     print("\n[Smoke Test] Initializing IntentSense end-to-end components...")
@@ -1196,6 +1907,241 @@ def run_smoke_test() -> bool:
     assert "System locked" in dec_locked_end.text
     print("     ✓ System successfully locked and swipe detector reset.")
 
+    # 7. Testing Natural Language Typed Commands (Phase 3 safety & parsing)
+    print("  7. Testing Natural Language Typed Commands (Phase 3 safety & parsing)...")
+    # 7a. Offline parsing of command
+    parsed_cmd = explainer.llm_assistant.parse_natural_command("increase volume", Context.MEDIA)
+    assert parsed_cmd.is_valid
+    assert parsed_cmd.intent == Intent.VOLUME_UP
+    assert parsed_cmd.action_id == "volume_up"
+
+    # 7b. Attempt execution while LOCKED -> must be REJECTED with SYSTEM_LOCKED
+    assert activation_sm.state == SystemState.LOCKED
+    res_locked_cmd = intent_engine.process_typed_intent(
+        command_intent=parsed_cmd.intent,
+        is_active=(activation_sm.state == SystemState.ACTIVE),
+        target_context=Context.MEDIA,
+    )
+    assert not res_locked_cmd.accepted
+    assert res_locked_cmd.reason == IntentReason.SYSTEM_LOCKED
+    print("     ✓ Verified typed command while LOCKED was safely blocked (SYSTEM_LOCKED).")
+
+    # 7c. Unlock system and execute typed command in dry-run mode
+    activation_sm.process_confirmed("OpenPalm", is_confirmed=True, hold_duration=1.0, timestamp=10.0)
+    assert activation_sm.state == SystemState.ACTIVE
+    res_active_cmd = intent_engine.process_typed_intent(
+        command_intent=parsed_cmd.intent,
+        is_active=(activation_sm.state == SystemState.ACTIVE),
+        target_context=Context.MEDIA,
+    )
+    assert res_active_cmd.accepted
+    assert res_active_cmd.intent == Intent.VOLUME_UP
+    act_cmd_out = action_executor.execute(res_active_cmd)
+    assert act_cmd_out.success
+    assert act_cmd_out.action_name == "volume_up"
+    assert "DRY RUN" in act_cmd_out.message
+    print("     ✓ Verified typed command while ACTIVE executed in dry-run mode.")
+
+    # 7d. Test Context Mismatch rejection
+    parsed_slide_cmd = explainer.llm_assistant.parse_natural_command("next slide", Context.PRESENTATION)
+    assert parsed_slide_cmd.intent == Intent.NEXT_SLIDE
+    res_mismatch = intent_engine.process_typed_intent(
+        command_intent=parsed_slide_cmd.intent,
+        is_active=True,
+        target_context=Context.MEDIA,  # MEDIA context does not support NEXT_SLIDE
+    )
+    assert not res_mismatch.accepted
+    assert res_mismatch.reason == IntentReason.NO_MAPPING
+    print("     ✓ Verified typed command context mismatch was safely rejected (NO_MAPPING).")
+
+    # 8. Testing Phase 4: Touchless AI Coaching & Practice Mode
+    print("  8. Testing Touchless AI Coaching & Practice Mode (Phase 4)...")
+    # 8a. Telemetry aggregation & struggle detection
+    explainer.telemetry_aggregator.clear()
+    now_ts = 20.0
+    # Feed repeated hold deficits (holding 0.35s when target is 0.5s and dropping)
+    for i in range(3):
+        explainer.record_interaction(
+            timestamp=now_ts + i * 0.5,
+            decision_msg=DecisionMessage(category=DecisionCategory.WAITING, text="WAITING — Tracking Pointing"),
+            gesture="Pointing",
+            confidence=0.85,
+            effective_threshold=0.75,
+            hold_duration=0.35,
+            target_hold=0.50,
+            context=Context.PRESENTATION,
+        )
+        explainer.record_interaction(
+            timestamp=now_ts + i * 0.5 + 0.1,
+            decision_msg=DecisionMessage(category=DecisionCategory.WAITING, text="WAITING — Tracking Pointing"),
+            gesture="Pointing",
+            confidence=0.85,
+            effective_threshold=0.75,
+            hold_duration=0.05,
+            target_hold=0.50,
+            context=Context.PRESENTATION,
+        )
+    toast_msg = explainer.check_proactive_coaching(current_timestamp=now_ts + 2.0, context=Context.PRESENTATION)
+    assert toast_msg is not None
+    assert "longer" in toast_msg or "steady" in toast_msg
+    active_t = explainer.get_active_toast(current_timestamp=now_ts + 2.5)
+    assert active_t is not None
+    assert active_t[0] == toast_msg
+    assert 0.0 < active_t[1] <= 1.0
+    print("     ✓ Verified proactive AI coaching toast generated for repeated hold deficits.")
+
+    # 8b. Touchless Onboarding Controller progression (zero keyboard)
+    onboard_ctrl = TouchlessOnboardingController()
+    assert onboard_ctrl.current_step == OnboardingStepId.UNLOCK
+
+    # Step 1: OpenPalm hold progresses to unlock
+    res_step1 = onboard_ctrl.update("OpenPalm", 0.95, hold_duration=0.5, target_hold=1.0, is_confirmed=False, timestamp=1.0)
+    assert res_step1.progress == 0.5
+    assert not res_step1.is_step_complete
+
+    res_step1_done = onboard_ctrl.update("OpenPalm", 0.95, hold_duration=1.0, target_hold=1.0, is_confirmed=True, just_activated=True, timestamp=1.5)
+    assert res_step1_done.is_step_complete
+    assert "unlocked" in res_step1_done.feedback.lower()
+
+    # After transition delay, advances to Step 2
+    res_step2 = onboard_ctrl.update(None, 0.0, 0.0, 0.5, False, timestamp=3.0)
+    assert onboard_ctrl.current_step == OnboardingStepId.VOLUME_UP
+    assert res_step2.target_gesture == "ThumbsUp"
+    print("     ✓ Verified touchless onboarding progression and step transition.")
+
+    # 8c. Testing LOCKED-state AI coaching (ThumbsUp while locked -> coaching toast)
+    explainer.telemetry_aggregator.clear()
+    activation_sm.lock()
+    assert activation_sm.state == SystemState.LOCKED
+    now_locked = 30.0
+    for i in range(3):
+        explainer.record_interaction(
+            timestamp=now_locked + i * 0.3,
+            decision_msg=DecisionMessage(category=DecisionCategory.REJECTED, text="REJECTED — System locked (Hold OpenPalm to unlock)"),
+            gesture="ThumbsUp",
+            confidence=0.92,
+            effective_threshold=0.80,
+            hold_duration=0.5,
+            target_hold=0.5,
+            reason="REJECTED — System locked (Hold OpenPalm to unlock)",
+            context=Context.MEDIA,
+            state=SystemState.LOCKED,
+        )
+    locked_toast = explainer.check_proactive_coaching(current_timestamp=now_locked + 1.2, context=Context.MEDIA)
+    assert locked_toast is not None
+    assert "OpenPalm" in locked_toast and "ThumbsUp cannot execute actions while locked" in locked_toast
+    assert explainer.get_active_toast(current_timestamp=now_locked + 1.5) is not None
+
+    # Verify OpenPalm unlock clears the locked coaching toast
+    activation_sm.process_confirmed("OpenPalm", is_confirmed=True, hold_duration=1.0, timestamp=now_locked + 2.0)
+    assert activation_sm.state == SystemState.ACTIVE
+    explainer.clear_active_toast()
+    assert explainer.get_active_toast(current_timestamp=now_locked + 2.1) is None
+    print("     ✓ Verified repeated ThumbsUp while locked triggers coaching & clears upon OpenPalm unlock.")
+
+    # 9. Testing Phase 5: Local Voice Activation
+    print("  9. Testing Local Voice Activation (Phase 5)...")
+    voice_mgr = VoiceActivationManager(permission_granted=False, enable_mic_stream=False)
+    assert voice_mgr.state == VoiceState.DISABLED
+    assert not voice_mgr.has_permission
+    st_disabled = voice_mgr.update(current_timestamp=40.0)
+    assert st_disabled.state == VoiceState.DISABLED
+    assert not st_disabled.is_capturing
+
+    # Grant permission -> STANDBY
+    voice_mgr.grant_permission()
+    assert voice_mgr.state == VoiceState.STANDBY
+    assert voice_mgr.has_permission
+    st_standby = voice_mgr.update(current_timestamp=40.1)
+    assert st_standby.state == VoiceState.STANDBY
+
+    # Trigger wake-word -> CAPTURING_QUERY
+    wake_called = []
+    voice_mgr.on_wake_callback = lambda: wake_called.append(True)
+    voice_mgr.trigger_wake_word()
+    assert len(wake_called) == 1
+    assert voice_mgr.state == VoiceState.WAKE_DETECTED
+
+    st_capturing = voice_mgr.update(current_timestamp=40.2)
+    assert st_capturing.state == VoiceState.CAPTURING_QUERY
+    assert st_capturing.is_capturing
+    assert 7.0 <= st_capturing.time_remaining <= 8.0
+
+    # Advance clock past initial no-speech timeout (8.0s default)
+    st_timeout = voice_mgr.update(current_timestamp=49.0)
+    assert st_timeout.state == VoiceState.TIMEOUT
+    assert not st_timeout.is_capturing
+
+    # Auto-resets back to STANDBY after timeout duration (1.2s)
+    st_restandby = voice_mgr.update(current_timestamp=50.5)
+    assert st_restandby.state == VoiceState.STANDBY
+
+    # Test cancellation
+    voice_mgr.trigger_wake_word()
+    voice_mgr.update(current_timestamp=51.0)
+    assert voice_mgr.is_capturing
+    voice_mgr.cancel()
+    assert voice_mgr.state == VoiceState.STANDBY
+    assert not voice_mgr.is_capturing
+
+    # Clean shutdown
+    voice_mgr.close()
+    assert voice_mgr.state == VoiceState.DISABLED
+    print("     ✓ Verified Local Voice Activation permissions, wake-word detection, capture timeout, and cancellation.")
+
+    # 10. Testing Phase 6: Voice Conversation & On-Device STT / LLM Assistance
+    print("  10. Testing Voice Conversation & Assistant (Phase 6)...")
+    summary_mock = {
+        "state": "LOCKED",
+        "context": "MEDIA",
+        "gesture_mappings": {"OpenPalm": "Unlock (Hold 1.0s)", "ThumbsUp": "Volume Up"},
+        "custom_gestures": [],
+        "is_locked": True,
+    }
+    voice_qa_mgr = VoiceActivationManager(
+        permission_granted=True,
+        enable_mic_stream=False,
+        llm_assistant=explainer.llm_assistant,
+        get_app_state_summary=lambda: summary_mock,
+    )
+
+    # 10a. Question about locked state
+    resp_locked = voice_qa_mgr.ask_question("how do i unlock")
+    assert resp_locked is not None
+    assert "OpenPalm" in resp_locked.answer
+    assert resp_locked.topic == "LOCKED_STATE"
+
+    # Verify HUD status transitions to RESPONDING
+    st_resp = voice_qa_mgr.update(current_timestamp=60.0)
+    assert st_resp.state == VoiceState.RESPONDING
+    assert st_resp.recognized_question == "how do i unlock"
+    assert "OpenPalm" in (st_resp.response_text or "")
+    assert st_resp.time_remaining > 0.0
+
+    # 10b. Safety Gate verification: asking voice assistant to execute action does NOT bypass safety
+    resp_safety = voice_qa_mgr.ask_question("can you please volume up")
+    assert resp_safety is not None
+    assert "assistance only" in resp_safety.answer or "not direct" in resp_safety.answer
+    assert "OpenPalm" in resp_safety.answer
+
+    # 10c. Context-aware question about Media mode
+    summary_mock["is_locked"] = False
+    summary_mock["state"] = "ACTIVE"
+    resp_media = voice_qa_mgr.ask_question("what gestures can i use in media mode")
+    assert resp_media is not None
+    assert "ThumbsUp" in resp_media.answer or "volume" in resp_media.answer.lower()
+
+    # 10d. Dismissing via cancel resets to STANDBY
+    voice_qa_mgr.cancel()
+    assert voice_qa_mgr.state == VoiceState.STANDBY
+    st_cancel = voice_qa_mgr.update(current_timestamp=61.0)
+    assert st_cancel.state == VoiceState.STANDBY
+    assert st_cancel.recognized_question is None
+
+    # Clean shutdown
+    voice_qa_mgr.close()
+    print("     ✓ Verified Voice Conversation on-device STT, context-aware answers, safety gate, and HUD status.")
+
     print("\n✅ End-to-end orchestration smoke test PASSED successfully!\n")
     return True
 
@@ -1211,21 +2157,41 @@ def main() -> None:
         help="Enable LIVE system action execution (default: Safe DRY-RUN).",
     )
     parser.add_argument(
+        "--voice",
+        action="store_true",
+        default=False,
+        help="Enable local microphone voice wake-word ('Hello Sense').",
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         default=False,
         help="Run headless component orchestration smoke test and exit.",
     )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="Optional Google Gemini API key (or set via GEMINI_API_KEY environment variable).",
+    )
     args = parser.parse_args()
+
+    if args.api_key:
+        os.environ["GEMINI_API_KEY"] = args.api_key.strip().strip("'\"")
 
     if args.smoke:
         success = run_smoke_test()
         sys.exit(0 if success else 1)
 
+    gemini_key_present = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+
     print("=" * 65)
     print("  IntentSense — Unified Live Application")
     print("=" * 65)
     print(f"  Mode         : {'*** LIVE OS ACTIONS ***' if args.live else 'SAFE DRY-RUN (Default)'}")
+    print(f"  Voice        : {'ENABLED (Microphone Permitted)' if args.voice else 'DISABLED (Press V to permit)'}")
+    print(f"  AI Provider  : {'ONLINE (Google Gemini)' if gemini_key_present else 'OFFLINE (Local Heuristics)'}")
+    print(f"  Gemini Key   : {'CONFIGURED (Loaded)' if gemini_key_present else 'NOT CONFIGURED'}")
     print(f"  Platform     : {sys.platform}")
     print(f"  Model Path   : {MODEL_PATH}")
     print(f"  Confidence   : >= {int(CONFIDENCE_THRESHOLD * 100)}%")
@@ -1279,6 +2245,47 @@ def main() -> None:
     register_presentation_handlers(action_executor, dry_run=not args.live)
     explainer = DecisionExplainer()
 
+    def get_voice_app_state_summary() -> Dict[str, Any]:
+        ctx = context_manager.get_current_context()
+        mappings: Dict[str, str] = {}
+        if ctx == Context.MEDIA:
+            mappings = {
+                "OpenPalm": "Unlock (Hold 1.0s)",
+                "ThumbsUp": "Volume Up",
+                "Fist": "Volume Down",
+                "Swipe Left": "Previous Track",
+                "Swipe Right": "Next Track",
+            }
+        elif ctx == Context.PRESENTATION:
+            mappings = {
+                "OpenPalm": "Unlock (Hold 1.0s)",
+                "Pointing": "Next Slide",
+                "Swipe Left": "Previous Slide",
+                "Swipe Right": "Next Slide",
+            }
+        elif ctx == Context.CUSTOM:
+            for prof in custom_manager.list_gestures():
+                mappings[prof.name] = ", ".join(f"{k}->{v}" for k, v in prof.mappings.items())
+
+        return {
+            "state": activation_sm.state.value,
+            "context": ctx.value,
+            "gesture_mappings": mappings,
+            "custom_gestures": [p.name for p in custom_manager.list_gestures()],
+            "is_locked": activation_sm.state == SystemState.LOCKED,
+            "onboarding_active": (app_ui_mode == AppUIMode.ONBOARDING),
+        }
+
+    def on_voice_wake() -> None:
+        print("[Voice] Wake-word 'Hello Sense' DETECTED! on_wake_callback executed.")
+
+    voice_manager = VoiceActivationManager(
+        permission_granted=args.voice,
+        llm_assistant=explainer.llm_assistant,
+        get_app_state_summary=get_voice_app_state_summary,
+        on_wake_callback=on_voice_wake,
+    )
+
     # -------------------------------------------------------------------------
     # 2. Open Webcam
     # -------------------------------------------------------------------------
@@ -1321,6 +2328,12 @@ def main() -> None:
     manage_delete_confirm: Optional[str] = None
     manage_remapping: bool = False
     test_consec_frames: int = 0
+    show_explanation_drawer: bool = False
+    command_query: str = ""
+    command_error: str = ""
+    parsed_command: Optional[NaturalCommandResponse] = None
+    command_is_loading: bool = False
+    onboarding_controller = TouchlessOnboardingController()
 
     print("\n✅ Application running. Focus OpenCV window and use 'Q' to quit.\n")
 
@@ -1332,6 +2345,7 @@ def main() -> None:
                 break
 
             now = time.monotonic()
+            voice_status = voice_manager.update(current_timestamp=now)
 
             # -----------------------------------------------------------------
             # Step 1: Hand Detection & Palm Landmark Extraction
@@ -1363,6 +2377,118 @@ def main() -> None:
                     app_ui_mode = AppUIMode.LIVE
                 elif key in (ord("q"), ord("Q")):
                     break
+
+            elif app_ui_mode == AppUIMode.COMMAND_BAR:
+                draw_command_bar_overlay(
+                    frame=frame,
+                    query_buffer=command_query,
+                    error_msg=command_error,
+                    is_loading=command_is_loading,
+                    provider_status=explainer.provider_status,
+                )
+                cv2.imshow("IntentSense — Unified Live Application", frame)
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == 27:  # ESC cancels
+                    app_ui_mode = AppUIMode.LIVE
+                    command_query = ""
+                    command_error = ""
+                    command_is_loading = False
+                    parsed_command = None
+                elif key in (10, 13) and not command_is_loading:  # ENTER submits asynchronously
+                    clean_query = command_query.strip()
+                    if not clean_query:
+                        command_error = "Please enter a command phrase."
+                    else:
+                        command_is_loading = True
+                        command_error = ""
+                        active_ctx = context_manager.get_current_context()
+
+                        def _on_parsed(res: Optional[NaturalCommandResponse]) -> None:
+                            nonlocal command_is_loading, parsed_command, command_error, app_ui_mode
+                            if app_ui_mode != AppUIMode.COMMAND_BAR:
+                                command_is_loading = False
+                                return
+                            command_is_loading = False
+                            if res is not None and res.is_valid and res.intent:
+                                parsed_command = res
+                                command_error = ""
+                                app_ui_mode = AppUIMode.COMMAND_CONFIRM
+                            else:
+                                command_error = (
+                                    res.explanation
+                                    if res and res.explanation
+                                    else "Command could not be mapped to any valid action."
+                                )
+
+                        explainer.llm_assistant.query_async(
+                            explainer.llm_assistant.parse_natural_command,
+                            clean_query,
+                            active_ctx,
+                            callback=_on_parsed,
+                        )
+                elif not command_is_loading:
+                    if key in (8, 127):  # Backspace
+                        command_query = command_query[:-1]
+                        command_error = ""
+                    elif 32 <= key <= 126:
+                        ch = chr(key)
+                        if len(command_query) < 60:
+                            command_query += ch
+                            command_error = ""
+
+            elif app_ui_mode == AppUIMode.COMMAND_CONFIRM:
+                draw_command_confirm_overlay(
+                    frame=frame,
+                    query_text=command_query,
+                    parsed_command=parsed_command,
+                    state=activation_sm.state,
+                    current_context=context_manager.get_current_context(),
+                    live_mode=args.live,
+                    error_msg=command_error,
+                )
+                cv2.imshow("IntentSense — Unified Live Application", frame)
+                key = cv2.waitKey(1) & 0xFF
+
+                if key in (27, ord("n"), ord("N")):  # Cancel
+                    app_ui_mode = AppUIMode.LIVE
+                    command_query = ""
+                    command_error = ""
+                    parsed_command = None
+                    print("[Typed Command] Command cancelled by user.")
+                elif key in (10, 13, ord("y"), ord("Y")):  # Confirm
+                    if activation_sm.state == SystemState.LOCKED:
+                        command_error = "Execution blocked: System is LOCKED. Hold OpenPalm to unlock."
+                    elif parsed_command is not None and parsed_command.intent:
+                        intent_res = intent_engine.process_typed_intent(
+                            command_intent=parsed_command.intent,
+                            is_active=(activation_sm.state == SystemState.ACTIVE),
+                            target_context=context_manager.get_current_context(),
+                        )
+                        if intent_res.accepted:
+                            act_out = action_executor.execute(intent_res)
+                            last_action_event = (act_out.action_name or "Command", "EXECUTED", now)
+                            last_event_snapshot = EventSnapshot(
+                                decision=DecisionMessage(
+                                    category=DecisionCategory.ACTION_EXECUTED,
+                                    text=f"{act_out.action_name} ({act_out.message})",
+                                    color_bgr=(0, 255, 0),
+                                ),
+                                intent=intent_res.intent,
+                                action_name=act_out.action_name,
+                                action_status="EXECUTED",
+                            )
+                            last_event_timestamp = now
+                            print(
+                                f"[Typed Command] ⚡ {intent_res.intent.value:<14} -> "
+                                f"{act_out.action_name} ({act_out.message})"
+                            )
+                            app_ui_mode = AppUIMode.LIVE
+                            command_query = ""
+                            command_error = ""
+                            parsed_command = None
+                        else:
+                            command_error = f"Rejected by Intent Engine: {intent_res.reason.value}"
 
             elif app_ui_mode == AppUIMode.ENROLL_NAME:
                 draw_enroll_name_overlay(frame, typing_buffer, typing_error)
@@ -1630,6 +2756,56 @@ def main() -> None:
                 if key in (27, ord("q"), ord("Q"), ord("t"), ord("T")):  # ESC, Q, T
                     app_ui_mode = AppUIMode.LIVE
 
+            elif app_ui_mode == AppUIMode.ONBOARDING:
+                swipe_res = swipe_detector.update(
+                    x=palm_x,
+                    y=palm_y,
+                    timestamp=now,
+                    palm_size=palm_size,
+                    hand_present=hand_present,
+                )
+                raw_gesture: Optional[str] = None
+                confidence: float = 0.0
+                active_filter = (
+                    activation_sm.activation_filter
+                    if activation_sm.state == SystemState.LOCKED
+                    else activation_sm.command_filter
+                )
+                if hand_present and norm_features is not None:
+                    raw_gesture, confidence = predict_with_confidence(bundle, norm_features)
+                    filter_res = active_filter.process(raw_gesture, confidence, timestamp=now)
+                    act_res = activation_sm.process_filter_result(filter_res, timestamp=now)
+                else:
+                    filter_res = active_filter.process(None, 0.0, timestamp=now)
+                    act_res = activation_sm.process_filter_result(filter_res, timestamp=now)
+
+                hold_dur = filter_res.hold_duration if filter_res else 0.0
+                target_hold = (
+                    ACTIVATION_HOLD_DURATION
+                    if onboarding_controller.current_step == OnboardingStepId.UNLOCK
+                    else COMMAND_HOLD_DURATION
+                )
+                is_confirmed = filter_res.is_confirmed if filter_res else False
+
+                onboard_res = onboarding_controller.update(
+                    gesture=raw_gesture,
+                    confidence=confidence,
+                    hold_duration=hold_dur,
+                    target_hold=target_hold,
+                    is_confirmed=is_confirmed,
+                    swipe_direction=swipe_res.direction,
+                    just_activated=act_res.just_activated,
+                    timestamp=now,
+                )
+
+                draw_onboarding_overlay(frame, onboard_res)
+                cv2.imshow("IntentSense — Unified Live Application", frame)
+                key = cv2.waitKey(1) & 0xFF
+
+                if key in (27, ord("o"), ord("O"), ord("q"), ord("Q")):
+                    app_ui_mode = AppUIMode.LIVE
+                    print("[Control] Exited Touchless Onboarding Mode.")
+
             else:
                 # -------------------------------------------------------------
                 # Standard Live Application Execution Pipeline
@@ -1707,6 +2883,7 @@ def main() -> None:
                     action_status = "ACTIVATED"
                     last_action_event = ("OpenPalm", "ACTIVATED", now)
                     swipe_detector.reset()
+                    explainer.clear_active_toast()
                     print(f"[Event] 🔓 SYSTEM ACTIVATED at t={now:.1f}s")
 
                 elif act_res.just_locked:
@@ -1814,6 +2991,18 @@ def main() -> None:
                         action_status=action_status,
                     )
                     last_event_timestamp = now
+                    if show_explanation_drawer:
+                        explainer.request_coaching_async(
+                            decision_msg=decision_msg,
+                            state=activation_sm.state,
+                            context=context_manager.get_current_context(),
+                            raw_gesture=raw_gesture,
+                            confidence=confidence,
+                            effective_threshold=effective_thresh,
+                            hold_duration=hold_dur,
+                            target_hold=target_hold,
+                            is_swipe=is_swipe_detected,
+                        )
 
                 (
                     display_decision,
@@ -1850,10 +3039,48 @@ def main() -> None:
                     live_mode=args.live,
                     swipe_status=swipe_hud_str,
                     decision=display_decision,
+                    voice_status=voice_status,
                 )
+
+                # Phase 4: Proactive Telemetry Aggregation & Struggle Coaching
+                explainer.record_interaction(
+                    timestamp=now,
+                    decision_msg=display_decision if display_decision else decision_msg,
+                    gesture=raw_gesture,
+                    confidence=confidence,
+                    effective_threshold=effective_thresh,
+                    hold_duration=hold_dur,
+                    target_hold=target_hold,
+                    reason=decision_msg.text if (decision_msg and "LOCKED" in decision_msg.text) else (arb_res.reason if (hand_present and arb_res is not None) else decision_msg.text),
+                    context=context_manager.get_current_context(),
+                    is_swipe=is_swipe_detected,
+                    state=activation_sm.state,
+                )
+                explainer.check_proactive_coaching(
+                    current_timestamp=now,
+                    context=context_manager.get_current_context(),
+                )
+                active_toast = explainer.get_active_toast(now)
+                if active_toast is not None and not show_explanation_drawer:
+                    draw_coaching_toast(frame, active_toast[0], active_toast[1])
 
                 if context_manager.get_current_context() == Context.CUSTOM:
                     draw_custom_mode_banner(frame, len(custom_manager.profiles))
+
+                if show_explanation_drawer:
+                    coaching_res = explainer.get_latest_coaching()
+                    target_ev_text = (
+                        last_event_snapshot.decision.text
+                        if last_event_snapshot
+                        else (decision_msg.text if decision_msg else "")
+                    )
+                    draw_explanation_drawer(
+                        frame=frame,
+                        coaching=coaching_res,
+                        is_loading=explainer.is_loading_coaching,
+                        provider_status=explainer.provider_status,
+                        event_text=target_ev_text,
+                    )
 
                 cv2.imshow("IntentSense — Unified Live Application", frame)
 
@@ -1861,6 +3088,51 @@ def main() -> None:
                 if key in (ord("q"), ord("Q")):
                     print("\nQuit requested by user.")
                     break
+                elif key == 27:
+                    if show_explanation_drawer:
+                        show_explanation_drawer = False
+                        print("[AI Explainer] Coaching drawer CLOSED via ESC.")
+                    if (
+                        voice_manager.is_capturing
+                        or voice_manager.is_processing
+                        or voice_manager.state in (VoiceState.RESPONDING, VoiceState.SPEAKING)
+                        or voice_manager.is_speaking
+                    ):
+                        voice_manager.cancel()
+                        print("[Voice] Active voice session CANCELLED via ESC.")
+                elif key in (ord("v"), ord("V")):
+                    is_enabled = voice_manager.toggle_permission()
+                    print(f"[Control] Microphone voice wake-word {'ENABLED (Permission Granted)' if is_enabled else 'DISABLED (Permission Revoked)'}.")
+                elif key in (ord("c"), ord("C")):
+                    voice_manager.reset_conversation()
+                    print("[Voice] Conversation history CLEARED via 'C' shortcut.")
+                elif key in (ord("x"), ord("X")):
+                    show_explanation_drawer = not show_explanation_drawer
+                    if show_explanation_drawer:
+                        target_dec = last_event_snapshot.decision if last_event_snapshot else decision_msg
+                        explainer.request_coaching_async(
+                            decision_msg=target_dec,
+                            state=activation_sm.state,
+                            context=context_manager.get_current_context(),
+                            raw_gesture=raw_gesture,
+                            confidence=confidence,
+                            effective_threshold=effective_thresh,
+                            hold_duration=hold_dur,
+                            target_hold=target_hold,
+                            is_swipe=is_swipe_detected,
+                        )
+                        print(f"[AI Explainer] Coaching drawer {'OPENED' if show_explanation_drawer else 'CLOSED'}")
+                elif key in (ord("o"), ord("O")):
+                    app_ui_mode = AppUIMode.ONBOARDING
+                    onboarding_controller.reset()
+                    print("[Control] Entered Touchless Onboarding Mode.")
+                elif key in (ord(":"), ord(";")):
+                    app_ui_mode = AppUIMode.COMMAND_BAR
+                    command_query = ""
+                    command_error = ""
+                    parsed_command = None
+                    command_is_loading = False
+                    print("[Control] Opened Natural Language Command Bar.")
                 elif key in (ord("r"), ord("R")):
                     activation_sm.reset()
                     swipe_detector.reset()
@@ -1911,6 +3183,8 @@ def main() -> None:
     finally:
         cap.release()
         detector.hand_landmarker.close()
+        explainer.close()
+        voice_manager.close()
         cv2.destroyAllWindows()
         print("IntentSense live application terminated safely.")
 
