@@ -3,7 +3,6 @@
 [![IntentSense Test Suite](https://github.com/mitsocswaroopjadhav-star/hand-gesture-recognition-/actions/workflows/tests.yml/badge.svg)](https://github.com/mitsocswaroopjadhav-star/hand-gesture-recognition-/actions/workflows/tests.yml)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20Apple%20Silicon%20(ARM64)-blue.svg)](https://www.apple.com/macos/)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-brightgreen.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
 **IntentSense** is a multimodal, real-time hand-gesture and conversational voice assistant engineered natively for macOS (optimized for Apple Silicon M-series). Built on top of MediaPipe Tasks, scikit-learn Random Forests, on-device `whisper.cpp` Speech-to-Text, and optional Google Gemini conversational intelligence, IntentSense enables intuitive, zero-touch control over your media, presentations, and daily workflows.
 
@@ -12,14 +11,14 @@
 ## 🌟 Key Features
 
 ### 1. Vision & Gesture Recognition Pipeline (Phases 1 & 2)
-- **High-Accuracy Pose Classification**: Recognizes core gestures (`OpenPalm`, `Fist`, `Pointing`, `ThumbsUp`, `ThumbsDown`, `Peace`) with **98.76% accuracy** on a 241-sample held-out test set.
-- **Wrist-Relative Geometric Normalization**: Landmark coordinates are translated relative to wrist landmark 0 and scaled by palm span, ensuring invariance to camera distance, hand position, and user orientation.
+- **High-Accuracy Pose Classification**: Recognizes core gestures (`OpenPalm`, `Fist`, `Pointing`, `ThumbsUp`, `ThumbsDown`, `Peace`) with **99.60% accuracy** on a 251-sample held-out test split (out of 1,251 total samples).
+- **Wrist-Relative Geometric Normalization**: Landmark coordinates are translated relative to wrist landmark 0 and scaled by palm span, ensuring translation and scale invariance across varying camera distances and hand positions within the frame.
 - **Intentional State Machine**: Prevents accidental triggers via a deliberate 1.0s `OpenPalm` hold-to-unlock mechanism.
 - **Dynamic Swipes & Inactivity Locking**: High-velocity horizontal swipes (`Swipe Left`, `Swipe Right`) for rapid media/slide navigation; automatically locks into a safe state after 30 seconds of inactivity.
 
 ### 2. Multi-Context Action Execution (Phase 3)
-- **Media Mode**: Touchless control over Play/Pause, Volume Up/Down, and Next/Previous track.
-- **Presentation Mode**: Next/Previous slide, start/stop slideshow, and touchless zoom.
+- **Media Mode**: Touchless control over Play/Pause (Fist), Volume Up (Thumbs Up), Volume Down (Thumbs Down), Next Track (Pointing / Swipe Right), and Previous Track (Peace / Swipe Left).
+- **Presentation Mode**: Start/Stop slideshow (Fist), Next Slide (Pointing / Swipe Right), Previous Slide (Peace / Swipe Left), Zoom In (Thumbs Up), and Zoom Out (Thumbs Down).
 - **Safe DRY-RUN Default**: Emits visual heads-up display (HUD) feedback without modifying system state. Live OS actions require explicit `--live` opt-in.
 - **Typed Natural Language Commands**: Parse and validate user typed text commands against intent safety gates.
 
@@ -81,11 +80,11 @@ flowchart TD
 
 ## 📊 Measured Evaluation & Accuracy
 
-During development, the underlying Random Forest gesture classification model achieved:
-- **Test Accuracy**: **98.76%** on a held-out test split of 241 landmark samples across all 6 core classes.
+The underlying Random Forest gesture classification model was evaluated using a 20% stratified train/test split:
+- **Dataset Size**: **1,251 samples** across 6 core classes (`Fist`, `OpenPalm`, `Peace`, `Pointing`, `ThumbsDown`, `ThumbsUp`).
+- **Test Set**: **251 held-out samples** (`test_size=0.2, random_state=42, stratify`).
+- **Test Accuracy**: **99.60%** (250/251 correct predictions).
 - **Feature Dimensionality**: 42 normalized float coordinates (21 hand joints $\times$ 2D).
-- **Latency**: Sub-15ms landmark extraction and inference per frame on Apple Silicon M4.
-- **Speech-to-Text Speed**: $\sim$1.1s for 11 seconds of audio using `whisper.cpp` CPU NEON/BLAS acceleration.
 
 ---
 
@@ -94,12 +93,13 @@ During development, the underlying Random Forest gesture classification model ac
 | Gesture | Media Context | Presentation Context | Custom Context |
 | :--- | :--- | :--- | :--- |
 | **Open Palm** | Unlock System (Hold 1.0s) | Unlock System (Hold 1.0s) | Unlock System (Hold 1.0s) |
-| **Thumbs Up** | Volume Up | — | Configurable |
-| **Fist** | Volume Down | — | Configurable |
-| **Pointing** | — | Next Slide | Configurable |
+| **Thumbs Up** | Volume Up | Zoom In | Configurable |
+| **Thumbs Down** | Volume Down | Zoom Out | Configurable |
+| **Pointing** | Next Track | Next Slide | Configurable |
+| **Peace** | Previous Track | Previous Slide | Configurable |
+| **Fist** | Play / Pause | Start / Stop Slideshow | Configurable |
 | **Swipe Left** | Previous Track | Previous Slide | Configurable |
 | **Swipe Right** | Next Track | Next Slide | Configurable |
-| **Peace** | Custom Enrollment / Unassigned | Custom Enrollment / Unassigned | Custom Gesture Matching |
 
 ---
 
@@ -178,6 +178,7 @@ When launching `IntentSense.app` on macOS, grant the following permissions when 
 ## 🔒 Privacy & User Data
 
 - **Zero Cloud Vision Data**: Video frames and biometric vectors are processed in RAM and discarded immediately.
+- **Anonymous Public Dataset**: `dataset/gestures.csv` contains only anonymous mathematical coordinate offsets (42 normalized float values relative to wrist joint landmark 0) across 1,251 samples. It contains zero raw camera frames, images, video, biometric identity markers, or personal identifiable data, and is approved for open training and reproducibility.
 - **Persistent User Data**: User custom gestures, settings, and logs are saved exclusively in:
   `~/Library/Application Support/IntentSense/custom_gestures.json`
   The application bundle itself remains strictly read-only.

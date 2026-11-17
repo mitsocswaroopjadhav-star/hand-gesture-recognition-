@@ -71,15 +71,15 @@ if [ -f "${REPO_DIR}/bin/whisper-cli" ]; then
     install_name_tool -add_rpath "@executable_path" "${REPO_DIR}/bin/whisper-cli" 2>/dev/null || true
 fi
 
-# 4. Clean previous build artifacts & configure local cache
-echo "[4/7] Cleaning previous build artifacts..."
-rm -rf "${BUILD_DIR}" "${DIST_DIR}"
-mkdir -p "${BUILD_DIR}/cache"
+# 4. Prepare build directories (preserves existing release files in dist/)
+echo "[4/7] Preparing build and release directories..."
+mkdir -p "${DIST_DIR}" "${BUILD_DIR}/cache"
+rm -rf "${APP_BUNDLE}" "${ZIP_ARCHIVE}" "${BUILD_DIR}/IntentSense"
 export PYINSTALLER_CONFIG_DIR="${BUILD_DIR}/cache"
 
 # 5. Run PyInstaller
 echo "[5/7] Running PyInstaller build (ONEDIR + WINDOWED)..."
-"${PYINSTALLER}" --noconfirm --clean --workpath "${BUILD_DIR}" --distpath "${DIST_DIR}" "${SPEC_FILE}"
+"${PYINSTALLER}" --noconfirm --workpath "${BUILD_DIR}" --distpath "${DIST_DIR}" "${SPEC_FILE}"
 
 if [ ! -d "${APP_BUNDLE}" ]; then
     echo "❌ Error: Application bundle ${APP_BUNDLE} was not created."
@@ -89,8 +89,6 @@ echo "  ✓ Successfully generated application bundle: ${APP_BUNDLE}"
 
 # 6. Apply Ad-Hoc Code Signature
 echo "[6/7] Applying macOS ad-hoc code signature..."
-# Remove any quarantine flags from bundled dylibs
-xattr -cr "${APP_BUNDLE}" 2>/dev/null || true
 codesign --force --deep --sign - "${APP_BUNDLE}"
 echo "  ✓ Ad-hoc code signature verified:"
 codesign --verify --verbose "${APP_BUNDLE}"
@@ -110,8 +108,6 @@ echo "  Distributable ZIP  : ${ZIP_ARCHIVE} (${ZIP_SIZE})"
 echo ""
 echo "Installation Instructions:"
 echo "  1. Unzip ${ZIP_ARCHIVE} (or copy ${APP_BUNDLE} to /Applications)."
-echo "  2. On first launch, macOS Gatekeeper may prompt to confirm opening."
-echo "     If needed, right-click and select 'Open', or run:"
-echo "     xattr -d com.apple.quarantine /Applications/IntentSense.app"
-echo "  3. Grant Camera and Microphone permissions in macOS System Settings."
+echo "  2. Open IntentSense.app (for ad-hoc signed builds, right-click and select 'Open')."
+echo "  3. Grant Camera and Microphone permissions in macOS System Settings when prompted."
 echo "=========================================================="
