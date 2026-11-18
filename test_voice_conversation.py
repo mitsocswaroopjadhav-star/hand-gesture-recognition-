@@ -1086,7 +1086,7 @@ class TestVoiceConversation(unittest.TestCase):
             "Explain quantum physics in detail",
             "What is the capital of Australia?",
         ]
-        expected_msg = "General knowledge answers require an internet connection. Gemini is currently unavailable."
+        expected_msg = "General knowledge answers require an internet connection. The online AI provider is currently unavailable."
         try:
             for q in general_queries:
                 resp = assistant.answer_voice_question(q, self.app_state)
@@ -1209,7 +1209,7 @@ class TestVoiceConversation(unittest.TestCase):
             "How does reinforcement learning work?",
             "Can you explain machine learning in simple terms?",
         ]
-        expected_unavailable = "General knowledge answers require an internet connection. Gemini is currently unavailable."
+        expected_unavailable = "General knowledge answers require an internet connection. The online AI provider is currently unavailable."
         try:
             for q in learning_queries:
                 resp = assistant.answer_voice_question(q, self.app_state)
@@ -1398,7 +1398,7 @@ class TestVoiceConversation(unittest.TestCase):
             "What is machine learning?",
             "Tell me about the Roman Empire",
         ]
-        expected_msg = "General knowledge answers require an internet connection. Gemini is currently unavailable."
+        expected_msg = "General knowledge answers require an internet connection. The online AI provider is currently unavailable."
         try:
             for q in queries:
                 resp = assistant.answer_voice_question(q, self.app_state)
