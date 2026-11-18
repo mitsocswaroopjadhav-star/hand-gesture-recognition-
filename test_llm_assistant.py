@@ -287,6 +287,55 @@ class TestLLMHttpProviderAndRemoteMocking(unittest.TestCase):
             self.assertEqual(provider.api_key, "test-env-key-12345")
             self.assertTrue(provider.is_configured)
 
+    def test_xai_env_var_selects_grok_provider(self) -> None:
+        """Verifies XAI_API_KEY selects Grok and its default model."""
+        with patch.dict(os.environ, {"XAI_API_KEY": "xai-test-key"}, clear=True):
+            provider = LLMHttpProvider()
+            self.assertEqual(provider.api_key, "xai-test-key")
+            self.assertEqual(provider.name, "grok")
+            self.assertEqual(provider.model_name, "grok-4.7")
+            self.assertTrue(provider.is_configured)
+
+    @patch("urllib.request.urlopen")
+    def test_grok_responses_api_payload_and_json_parsing(self, mock_urlopen: MagicMock) -> None:
+        """Verifies Grok Responses API authentication, request shape, and JSON parsing."""
+        response_payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": json.dumps({
+                                "answer": "Grok integration is active.",
+                                "suggested_action": "",
+                                "topic": "GENERAL",
+                                "category": "HELP",
+                            }),
+                        }
+                    ],
+                }
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps(response_payload).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        with patch.dict(os.environ, {"XAI_API_KEY": "xai-test-key"}, clear=True):
+            provider = LLMHttpProvider()
+            result = provider.generate_json("Say hello.", "Answer helpfully.")
+            request = mock_urlopen.call_args[0][0]
+            payload = json.loads(request.data.decode("utf-8"))
+
+        self.assertEqual(request.full_url, "https://api.x.ai/v1/responses")
+        self.assertEqual(request.get_header("Authorization"), "Bearer xai-test-key")
+        self.assertEqual(payload["model"], "grok-4.7")
+        self.assertEqual(payload["text"]["format"]["type"], "json_object")
+        self.assertFalse(payload["store"])
+        self.assertEqual(result["answer"], "Grok integration is active.")
+
     @patch("urllib.request.urlopen")
     def test_mock_gemini_remote_command_parsing(self, mock_urlopen: MagicMock) -> None:
         """Verifies parsing of remote Gemini API JSON responses."""
