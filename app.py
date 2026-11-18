@@ -115,7 +115,7 @@ from core.decision_explainer import (
     DecisionMessage,
     EventSnapshot,
 )
-from core.llm_assistant import ExplanationResponse, LLMAssistant, NaturalCommandResponse
+from core.llm_assistant import ExplanationResponse, LLMAssistant, LLMHttpProvider, NaturalCommandResponse
 from core.personalized_gestures import (
     ArbitrationResult,
     CustomMatchResult,
@@ -534,7 +534,7 @@ def draw_explanation_drawer(
         cv2.LINE_AA,
     )
 
-    badge_color = (0, 255, 0) if "GEMINI" in provider_status else (180, 180, 180)
+    badge_color = (0, 255, 0) if "ONLINE" in provider_status else (180, 180, 180)
     badge_text = f"[{provider_status}]"
     if is_loading:
         badge_text = "[AI REASONING...]"
@@ -1384,7 +1384,7 @@ def draw_command_bar_overlay(
             cv2.LINE_AA,
         )
     else:
-        badge_color = (0, 255, 0) if "GEMINI" in provider_status else (180, 180, 180)
+        badge_color = (0, 255, 0) if "ONLINE" in provider_status else (180, 180, 180)
         cv2.putText(
             frame,
             f"Provider: [{provider_status}]  |  Safety: Validated against Intent Engine",
@@ -2172,26 +2172,47 @@ def main() -> None:
         "--api-key",
         type=str,
         default=None,
-        help="Optional Google Gemini API key (or set via GEMINI_API_KEY environment variable).",
+        help="Legacy Gemini API key (prefer XAI_API_KEY for Grok).",
+    )
+    parser.add_argument(
+        "--xai-api-key",
+        type=str,
+        default=None,
+        help="Optional xAI Grok API key (or set XAI_API_KEY in the private IntentSense config).",
+    )
+    parser.add_argument(
+        "--xai-model",
+        type=str,
+        default=None,
+        help="Optional Grok model ID (default: grok-4.7).",
     )
     args = parser.parse_args()
 
     if args.api_key:
         os.environ["GEMINI_API_KEY"] = args.api_key.strip().strip("'\"")
+    if args.xai_api_key:
+        os.environ["XAI_API_KEY"] = args.xai_api_key.strip().strip("'\"")
+    if args.xai_model:
+        os.environ["XAI_MODEL"] = args.xai_model.strip()
 
     if args.smoke:
         success = run_smoke_test()
         sys.exit(0 if success else 1)
 
-    gemini_key_present = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    active_provider = LLMHttpProvider()
+    provider_ready = active_provider.is_configured
+    provider_name = active_provider.name.title() if provider_ready else "Offline"
+    active_key_name = "XAI_API_KEY" if active_provider.name == "grok" else "GEMINI_API_KEY"
 
     print("=" * 65)
     print("  IntentSense — Unified Live Application")
     print("=" * 65)
     print(f"  Mode         : {'*** LIVE OS ACTIONS ***' if args.live else 'SAFE DRY-RUN (Default)'}")
     print(f"  Voice        : {'ENABLED (Microphone Permitted)' if args.voice else 'DISABLED (Press V to permit)'}")
-    print(f"  AI Provider  : {'ONLINE (Google Gemini)' if gemini_key_present else 'OFFLINE (Local Heuristics)'}")
-    print(f"  Gemini Key   : {'CONFIGURED (Loaded)' if gemini_key_present else 'NOT CONFIGURED'}")
+    print(f"  AI Provider  : {'ONLINE (' + provider_name + ')' if provider_ready else 'OFFLINE (Local Heuristics)'}")
+    print(f"  {active_key_name:<13}: {'CONFIGURED (Loaded)' if provider_ready else 'NOT CONFIGURED'}")
+    if provider_ready:
+        print(f"  Model        : {active_provider.model_name}")
     print(f"  Platform     : {sys.platform}")
     print(f"  Model Path   : {MODEL_PATH}")
     print(f"  Confidence   : >= {int(CONFIDENCE_THRESHOLD * 100)}%")
