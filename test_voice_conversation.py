@@ -1282,7 +1282,7 @@ class TestVoiceConversation(unittest.TestCase):
             self.assertFalse(assistant.has_active_remote)
             resp = assistant.answer_voice_question("What is machine learning?", self.app_state)
             self.assertEqual(resp.provider, "offline")
-            self.assertEqual(resp.answer, "General knowledge answers require an internet connection. Gemini is currently unavailable.")
+            self.assertEqual(resp.answer, "General knowledge answers require an internet connection. The online AI provider is currently unavailable.")
             self.assertEqual(resp.topic, "OFFLINE_UNAVAILABLE")
         finally:
             assistant.close()
