@@ -902,11 +902,16 @@ class LLMHttpProvider:
     ) -> None:
         self._explicit_api_key = api_key
         self.endpoint_url = endpoint_url
-        self.model_name = (
-            model_name
-            or self._read_setting("XAI_MODEL")
-            or ("grok-4.7" if self._read_setting("XAI_API_KEY") else "gemini-1.5-flash")
-        )
+        if model_name:
+            self.model_name = model_name
+        elif api_key is not None:
+            # Explicit legacy/test keys retain the Gemini default.
+            self.model_name = "gemini-1.5-flash"
+        else:
+            self.model_name = (
+                self._read_setting("XAI_MODEL")
+                or ("grok-4.7" if self._read_setting("XAI_API_KEY") else "gemini-1.5-flash")
+            )
         self.timeout = timeout
         self.last_status: Optional[int] = None
         self.last_error: Optional[str] = None
@@ -946,16 +951,16 @@ class LLMHttpProvider:
 
     @property
     def _uses_xai(self) -> bool:
-        """Grok takes priority when an xAI API key is configured."""
-        return bool(self._read_setting("XAI_API_KEY"))
+        """Selects Grok for the default provider configuration."""
+        return self._explicit_api_key is None and bool(self._read_setting("XAI_API_KEY"))
 
     @property
     def api_key(self) -> str:
-        """Returns the Grok key first, then explicit or legacy Gemini credentials."""
-        xai_key = self._read_setting("XAI_API_KEY")
-        if xai_key:
-            return xai_key
-        raw_key = self._explicit_api_key or self._read_setting("GEMINI_API_KEY")
+        """Returns an explicit key when supplied; otherwise Grok first, then Gemini."""
+        if self._explicit_api_key is not None:
+            raw_key = self._explicit_api_key
+        else:
+            raw_key = self._read_setting("XAI_API_KEY") or self._read_setting("GEMINI_API_KEY")
         return raw_key.strip().strip(chr(34) + chr(39))
 
     @property
