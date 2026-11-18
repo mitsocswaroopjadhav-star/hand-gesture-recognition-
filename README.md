@@ -130,7 +130,7 @@ pip install -r requirements.txt
 bash scripts/setup_whisper.sh
 ```
 
-### 5. Configure Grok Online AI (Optional)
+### Configure Grok Online AI (Optional)
 
 Create an API key in the [xAI Console](https://console.x.ai/). For the installed macOS app, store it in the user-only configuration file:
 
