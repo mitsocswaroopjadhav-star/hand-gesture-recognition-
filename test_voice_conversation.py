@@ -1274,10 +1274,10 @@ class TestVoiceConversation(unittest.TestCase):
 
     def test_general_question_missing_api_key_fallback(self) -> None:
         """
-        Verifies that when GEMINI_API_KEY is not configured, general knowledge questions
+        Verifies that with no remote API key, general knowledge questions
         cleanly return the offline-unavailable message.
         """
-        assistant = LLMAssistant(api_key=None, endpoint_url=None)
+        assistant = LLMAssistant(api_key="", endpoint_url="")
         try:
             self.assertFalse(assistant.has_active_remote)
             resp = assistant.answer_voice_question("What is machine learning?", self.app_state)
