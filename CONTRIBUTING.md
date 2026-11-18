@@ -13,7 +13,7 @@ Thank you for your interest in contributing to **IntentSense**! We welcome bug r
 2. **Privacy by Design**:
    - Zero raw camera frames or 42D biometric landmark vectors are ever transmitted to external networks or LLM APIs.
    - Speech recognition operates completely offline and on-device via `whisper.cpp`.
-   - Online AI features (Google Gemini) are optional. A deterministic local rule-based engine provides full offline functionality.
+   - Online AI features use xAI Grok when `XAI_API_KEY` is set; legacy Gemini is also supported. A deterministic local rule-based engine provides full offline functionality. A deterministic local rule-based engine provides full offline functionality.
 
 3. **Touchless Ergonomics**:
    - State transitions require intentional unlock poses (`OpenPalm` hold for 1.0s) to prevent false positives.
@@ -76,8 +76,11 @@ python app.py
 # Live Mode with Voice Enabled
 python app.py --live --voice
 
-# With optional Gemini API key for online conversational coaching
-python app.py --voice --api-key "YOUR_GEMINI_KEY"
+# With Grok API key configured in .env or the IntentSense user config
+python app.py --voice
+
+# Alternatively, pass a key for a one-off development run (avoid shared terminals/history)
+python app.py --voice --xai-api-key "YOUR_XAI_KEY"
 ```
 
 ---
