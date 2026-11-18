@@ -918,20 +918,30 @@ class LLMHttpProvider:
         if value and value.strip():
             return value.strip().strip(chr(34) + chr(39))
 
+        config_paths = []
         try:
             from core.paths import get_user_data_dir
-
-            config_path = os.path.join(get_user_data_dir(), ".env")
-            with open(config_path, "r", encoding="utf-8") as config_file:
-                for line in config_file:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, raw_value = line.split("=", 1)
-                    if key.strip() == name:
-                        return raw_value.strip().strip(chr(34) + chr(39))
-        except (OSError, ImportError):
+            config_paths.append(os.path.join(get_user_data_dir(), ".env"))
+        except ImportError:
             pass
+
+        # Also support a gitignored project-root .env during development.
+        project_env = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+        if project_env not in config_paths:
+            config_paths.append(project_env)
+
+        for config_path in config_paths:
+            try:
+                with open(config_path, "r", encoding="utf-8") as config_file:
+                    for line in config_file:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, raw_value = line.split("=", 1)
+                        if key.strip() == name:
+                            return raw_value.strip().strip(chr(34) + chr(39))
+            except OSError:
+                continue
         return ""
 
     @property
@@ -955,10 +965,10 @@ class LLMHttpProvider:
     @property
     def name(self) -> str:
         """Identifies provider name for telemetry and HUD display."""
-        if self._uses_xai:
-            return "grok"
         if self.endpoint_url:
             return "custom_llm"
+        if self._uses_xai:
+            return "grok"
         return "gemini"
 
     def _sanitize_error_message(self, msg: str) -> str:
@@ -1110,7 +1120,7 @@ class LLMHttpProvider:
 
             sanitized_msg = self._sanitize_error_message(raw_err_msg)
             self.last_error = f"HTTP {e.code}: {sanitized_msg}"
-            print(f"[LLM Http] Gemini API HTTP error: status={e.code}, message=\"{sanitized_msg}\"")
+            print(f"[LLM Http] {self.name.title()} API HTTP error: status={e.code}, message=\"{sanitized_msg}\"")
             return None
         except urllib.error.URLError as e:
             reason_str = str(getattr(e, "reason", e))
@@ -1118,13 +1128,13 @@ class LLMHttpProvider:
             if is_timeout:
                 self.last_status = 408
                 self.last_error = f"Request timed out after {self.timeout:.1f}s"
-                print(f"[LLM Http] Gemini API request timed out after {self.timeout:.1f}s.")
+                print(f"[LLM Http] {self.name.title()} API request timed out after {self.timeout:.1f}s.")
             else:
                 self.last_status = None
                 reason_type = type(e.reason).__name__ if hasattr(e, "reason") else type(e).__name__
                 sanitized_reason = self._sanitize_error_message(str(e.reason))
                 self.last_error = f"Network connection failed: {sanitized_reason}"
-                print(f"[LLM Http] Gemini API connection error: {reason_type} ({sanitized_reason})")
+                print(f"[LLM Http] {self.name.title()} API connection error: {reason_type} ({sanitized_reason})")
             return None
         except (socket.timeout, TimeoutError):
             self.last_status = 408
@@ -1135,7 +1145,7 @@ class LLMHttpProvider:
             self.last_status = None
             sanitized_err = self._sanitize_error_message(str(e))
             self.last_error = f"{type(e).__name__}: {sanitized_err}"
-            print(f"[LLM Http] Gemini API unexpected error: {type(e).__name__} ({sanitized_err})")
+            print(f"[LLM Http] {self.name.title()} API unexpected error: {type(e).__name__} ({sanitized_err})")
             return None
 
         return None
@@ -1505,7 +1515,7 @@ class LLMAssistant:
     ) -> VoiceAssistantResponse:
         """
         Answers a user's spoken question about IntentSense, general knowledge, or technical topics
-        using Gemini with conversation history and offline fallback.
+        using the configured remote provider (Grok preferred) with conversation history and offline fallback.
         Ensures zero-audio and zero-vision data transfer.
         """
         _assert_no_vision_payload(question, app_state_summary)
@@ -1588,7 +1598,7 @@ class LLMAssistant:
                 self._add_to_history("assistant", ans_text)
                 return resp
             else:
-                print("[LLM Assistant] {selected_provider} response missing valid answer; evaluating fallback.")
+                print(f"[LLM Assistant] {selected_provider} response missing valid answer; evaluating fallback.")
         except Exception as e:
             print(f"[LLM Assistant] Exception querying {selected_provider}: {type(e).__name__}; evaluating fallback.")
 
@@ -1600,7 +1610,7 @@ class LLMAssistant:
             self._add_to_history("assistant", offline_resp.answer)
             return offline_resp
 
-        # For general queries, Gemini was requested but failed: surface sanitized diagnostic reason
+        # A remote provider was requested but failed: surface sanitized diagnostic reason
         last_status = getattr(self.http_provider, "last_status", None)
         last_error = getattr(self.http_provider, "last_error", None)
 
