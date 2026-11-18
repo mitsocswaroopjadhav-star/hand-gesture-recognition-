@@ -4,7 +4,7 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS%20Apple%20Silicon%20(ARM64)-blue.svg)](https://www.apple.com/macos/)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-brightgreen.svg)](https://www.python.org/)
 
-**IntentSense** is a multimodal, real-time hand-gesture and conversational voice assistant engineered natively for macOS (optimized for Apple Silicon M-series). Built on top of MediaPipe Tasks, scikit-learn Random Forests, on-device `whisper.cpp` Speech-to-Text, and optional Google Gemini conversational intelligence, IntentSense enables intuitive, zero-touch control over your media, presentations, and daily workflows.
+**IntentSense** is a multimodal, real-time hand-gesture and conversational voice assistant engineered natively for macOS (optimized for Apple Silicon M-series). Built on top of MediaPipe Tasks, scikit-learn Random Forests, on-device `whisper.cpp` Speech-to-Text, and optional xAI Grok conversational intelligence (with legacy Gemini compatibility), IntentSense enables intuitive, zero-touch control over your media, presentations, and daily workflows.
 
 ---
 
@@ -35,7 +35,7 @@
 - **Offline Whisper STT**: Transcribes questions locally using `whisper.cpp` and `ggml-base.en.bin` with Apple Silicon NEON & Accelerate BLAS acceleration.
 - **Dynamic Voice Activity Detection (VAD)**: Listens naturally until the user finishes speaking (1.2s trailing silence cutoff), accommodating variable-length questions up to a 30s safety ceiling.
 - **Dual AI Provider Architecture**:
-  - **Online**: Google Gemini for rich general-purpose and technical conversational assistance.
+  - **Online**: xAI Grok (`grok-4.7`) for general-purpose and technical conversational assistance. `XAI_API_KEY` selects Grok; legacy Gemini remains supported when no xAI key is configured.
   - **Offline Fallback**: Deterministic rule-based expert system answering all questions regarding IntentSense features, custom gestures, and locked states when offline.
 - **Spoken AI Audio Responses**: Uses native macOS `/usr/bin/say` for smooth, non-blocking audio answers, with automatic microphone suppression during playback to prevent self-triggering.
 
@@ -64,7 +64,7 @@ flowchart TD
         SM --> IE[Intent Engine & Context Manager]
         IE --> EXPLAIN[Decision Explainer & AI Coach]
         WHISPER --> LLM[LLM Assistant]
-        LLM -->|Online| GEMINI[Google Gemini API]
+        LLM -->|Online| GROK[xAI Grok API]
         LLM -->|Offline Fallback| RULES[Local Rule-Based Provider]
     end
 
@@ -130,6 +130,30 @@ pip install -r requirements.txt
 bash scripts/setup_whisper.sh
 ```
 
+### 5. Configure Grok Online AI (Optional)
+
+Create an API key in the [xAI Console](https://console.x.ai/). For the installed macOS app, store it in the user-only configuration file:
+
+```bash
+mkdir -p "$HOME/Library/Application Support/IntentSense"
+nano "$HOME/Library/Application Support/IntentSense/.env"
+```
+
+Add the following lines, replacing the placeholder with your key:
+
+```dotenv
+XAI_API_KEY=your_xai_api_key
+XAI_MODEL=grok-4.7
+```
+
+Save the file, then restrict access:
+
+```bash
+chmod 600 "$HOME/Library/Application Support/IntentSense/.env"
+```
+
+Restart IntentSense. Its startup status should show `ONLINE (Grok)`. The API key is read locally and is not part of the app bundle or Git repository. xAI API usage may require account credits.
+
 ### 4. Running the Application
 ```bash
 # 1. Run in Safe DRY-RUN mode (Default: visual feedback only, no OS actions executed)
@@ -141,8 +165,8 @@ python app.py --voice
 # 3. Run with Live OS actions enabled (controls system volume, slides, etc.)
 python app.py --live --voice
 
-# 4. Run with optional Gemini online AI key
-python app.py --voice --api-key "YOUR_GEMINI_API_KEY"
+# 4. Run with optional Grok online AI key (configure XAI_API_KEY first)
+python app.py --voice
 
 # 5. Run headless component orchestration smoke test
 python app.py --smoke
@@ -182,7 +206,7 @@ When launching `IntentSense.app` on macOS, grant the following permissions when 
 - **Persistent User Data**: User custom gestures, settings, and logs are saved exclusively in:
   `~/Library/Application Support/IntentSense/custom_gestures.json`
   The application bundle itself remains strictly read-only.
-- **Secure Fallback**: If Gemini encounters authentication errors, rate limits, or network timeouts, IntentSense immediately falls back to its offline rule engine without exposing keys or interrupting the camera loop.
+- **Secure Fallback**: If Grok (or legacy Gemini) encounters authentication errors, rate limits, or network timeouts, IntentSense immediately falls back to its offline rule engine without exposing keys or interrupting the camera loop.
 
 ---
 
@@ -217,7 +241,7 @@ hand-gesture-recognition-/
 │   ├── decision_explainer.py    # Decision explanations & AI coaching
 │   ├── feature_extractor.py     # 42D wrist-centered landmark normalization
 │   ├── intent_engine.py         # Gesture-to-intent routing
-│   ├── llm_assistant.py         # Gemini API client & offline rule fallback
+│   ├── llm_assistant.py         # Grok/Gemini API client & offline rule fallback
 │   ├── onboarding.py            # Touchless practice mode state engine
 │   ├── paths.py                 # Centralized development & .app path resolver
 │   ├── personalized_gestures.py # Custom gesture enrollment & 4-tier arbitration
@@ -241,4 +265,4 @@ hand-gesture-recognition-/
 ## 👨‍💻 Author & Acknowledgements
 
 - **Author**: Swaroop Jadhav
-- **Technologies**: Google MediaPipe, OpenCV, scikit-learn, whisper.cpp by Georgi Gerganov, Google Gemini.
+- **Technologies**: Google MediaPipe, OpenCV, scikit-learn, whisper.cpp by Georgi Gerganov, xAI Grok (with legacy Google Gemini support).
