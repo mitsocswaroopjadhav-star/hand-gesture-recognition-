@@ -876,8 +876,8 @@ class OfflineRuleBasedProvider:
         print(f"[LLM Offline] Query \"{question}\" did NOT match any IntentSense offline rule; routing to general-knowledge offline-unavailable response.")
         return VoiceAssistantResponse(
             question=question,
-            answer="General knowledge answers require an internet connection. Gemini is currently unavailable.",
-            suggested_action="Connect to the internet with GEMINI_API_KEY configured for general knowledge answers.",
+            answer="General knowledge answers require an internet connection. The online AI provider is currently unavailable.",
+            suggested_action="Configure XAI_API_KEY to enable Grok for general knowledge answers.",
             topic="OFFLINE_UNAVAILABLE",
             category="OFFLINE",
             provider="offline",
@@ -889,29 +889,79 @@ class OfflineRuleBasedProvider:
 # ---------------------------------------------------------------------------
 class LLMHttpProvider:
     """
-    Communicates with external LLM endpoints using standard Python urllib.
-    Requires ZERO heavy external libraries. Enforces fail-safe timeouts (default 8.0s).
+    Communicates with Grok, legacy Gemini, and OpenAI-compatible endpoints
+    using standard Python urllib. No additional SDK is required.
     """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         endpoint_url: Optional[str] = None,
-        model_name: str = "gemini-1.5-flash",
-        timeout: float = 8.0,
+        model_name: Optional[str] = None,
+        timeout: float = 30.0,
     ) -> None:
         self._explicit_api_key = api_key
         self.endpoint_url = endpoint_url
-        self.model_name = model_name
+        if model_name:
+            self.model_name = model_name
+        elif api_key is not None:
+            # Explicit legacy/test keys retain the Gemini default.
+            self.model_name = "gemini-1.5-flash"
+        else:
+            self.model_name = (
+                self._read_setting("XAI_MODEL")
+                or ("grok-4.7" if self._read_setting("XAI_API_KEY") else "gemini-1.5-flash")
+            )
         self.timeout = timeout
         self.last_status: Optional[int] = None
         self.last_error: Optional[str] = None
 
+    @staticmethod
+    def _read_setting(name: str) -> str:
+        """Reads a value from the environment or the private IntentSense user config."""
+        value = os.environ.get(name, "")
+        if value and value.strip():
+            return value.strip().strip(chr(34) + chr(39))
+
+        config_paths = []
+        try:
+            from core.paths import get_user_data_dir
+            config_paths.append(os.path.join(get_user_data_dir(), ".env"))
+        except ImportError:
+            pass
+
+        # Also support a gitignored project-root .env during development.
+        project_env = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+        if project_env not in config_paths:
+            config_paths.append(project_env)
+
+        for config_path in config_paths:
+            try:
+                with open(config_path, "r", encoding="utf-8") as config_file:
+                    for line in config_file:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, raw_value = line.split("=", 1)
+                        if key.strip() == name:
+                            return raw_value.strip().strip(chr(34) + chr(39))
+            except OSError:
+                continue
+        return ""
+
+    @property
+    def _uses_xai(self) -> bool:
+        """Selects Grok for the default provider configuration."""
+        return self._explicit_api_key is None and bool(self._read_setting("XAI_API_KEY"))
+
     @property
     def api_key(self) -> str:
-        """Dynamically retrieves API key from explicit value or GEMINI_API_KEY environment variable."""
-        raw_key = self._explicit_api_key or os.environ.get("GEMINI_API_KEY", "")
-        return raw_key.strip().strip("'\"")
+        """Returns an explicit key when supplied; otherwise Grok first, then Gemini."""
+        if self._explicit_api_key is not None:
+            raw_key = self._explicit_api_key
+        else:
+            raw_key = self._read_setting("XAI_API_KEY") or self._read_setting("GEMINI_API_KEY")
+        return raw_key.strip().strip(chr(34) + chr(39))
 
     @property
     def is_configured(self) -> bool:
@@ -922,6 +972,8 @@ class LLMHttpProvider:
         """Identifies provider name for telemetry and HUD display."""
         if self.endpoint_url:
             return "custom_llm"
+        if self._uses_xai:
+            return "grok"
         return "gemini"
 
     def _sanitize_error_message(self, msg: str) -> str:
@@ -945,16 +997,33 @@ class LLMHttpProvider:
         self.last_error = None
 
         if not self.is_configured:
-            self.last_error = "GEMINI_API_KEY not configured"
-            print("[LLM Http] Provider not configured (GEMINI_API_KEY missing and no endpoint URL).")
+            self.last_error = "No remote API key or custom endpoint configured"
+            print("[LLM Http] Provider not configured (XAI_API_KEY/GEMINI_API_KEY missing and no endpoint URL).")
             return None
 
-        # Standard Gemini REST API URL
-        if not self.endpoint_url and self.api_key:
+        # xAI Responses API (recommended by xAI for new integrations).
+        # store=False avoids retaining the prompt and response on xAI servers.
+        if not self.endpoint_url and self._uses_xai:
+            url = "https://api.x.ai/v1/responses"
+            payload = {
+                "model": self.model_name,
+                "input": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                "text": {"format": {"type": "json_object"}},
+                "store": False,
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            }
+        # Retain the Gemini path so existing installations can still use it.
+        elif not self.endpoint_url and self.api_key:
             model_id = self.model_name.replace("models/", "")
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={self.api_key}"
             payload = {
-                "contents": [{"parts": [{"text": f"{system_prompt}\n\nUSER PROMPT: {prompt}"}]}],
+                "contents": [{"parts": [{"text": f"{system_prompt}\\n\\nUSER PROMPT: {prompt}"}]}],
                 "generationConfig": {
                     "responseMimeType": "application/json",
                     "temperature": 0.2,
@@ -986,9 +1055,27 @@ class LLMHttpProvider:
                 http_status = getattr(resp, "status", 200)
                 self.last_status = http_status
                 self.last_error = None
-                print(f"[LLM Http] Gemini HTTP status: {http_status} (Success)")
+                print(f"[LLM Http] {self.name.title()} HTTP status: {http_status} (Success)")
                 body = resp.read().decode("utf-8")
                 data = json.loads(body)
+
+                # Parse xAI Responses API output_text content.
+                if "output" in data and isinstance(data["output"], list):
+                    raw_text = ""
+                    for output_item in data["output"]:
+                        for content_item in output_item.get("content", []):
+                            if content_item.get("type") == "output_text":
+                                raw_text += content_item.get("text", "")
+                    if raw_text:
+                        cleaned = _clean_json_markdown(raw_text)
+                        try:
+                            return json.loads(cleaned)
+                        except json.JSONDecodeError:
+                            if cleaned and not cleaned.startswith("{"):
+                                return {"answer": cleaned, "suggested_action": "", "topic": "GENERAL", "category": "HELP"}
+                            return None
+                    self.last_error = "Grok response returned no output text"
+                    return None
 
                 # Parse Gemini response format
                 if "candidates" in data and data["candidates"]:
@@ -1006,8 +1093,8 @@ class LLMHttpProvider:
                             return None
                     else:
                         finish_reason = candidate.get("finishReason", "UNKNOWN")
-                        print(f"[LLM Http] Gemini candidate returned no parts. Finish reason: {finish_reason}")
-                        self.last_error = f"Gemini finished without content: {finish_reason}"
+                        print(f"[LLM Http] {self.name.title()} candidate returned no parts. Finish reason: {finish_reason}")
+                        self.last_error = f"{self.name.title()} finished without content: {finish_reason}"
                         return None
                 # Parse OpenAI / Ollama response format
                 elif "choices" in data and data["choices"]:
@@ -1020,8 +1107,8 @@ class LLMHttpProvider:
                             return {"answer": cleaned, "suggested_action": "", "topic": "GENERAL", "category": "HELP"}
                         return None
                 else:
-                    print("[LLM Http] Gemini HTTP response returned no candidates or choices.")
-                    self.last_error = "Gemini response returned no candidates or choices."
+                    print(f"[LLM Http] {self.name.title()} HTTP response returned no candidates or choices.")
+                    self.last_error = f"{self.name.title()} response returned no candidates or choices."
                     return None
         except urllib.error.HTTPError as e:
             self.last_status = e.code
@@ -1038,7 +1125,7 @@ class LLMHttpProvider:
 
             sanitized_msg = self._sanitize_error_message(raw_err_msg)
             self.last_error = f"HTTP {e.code}: {sanitized_msg}"
-            print(f"[LLM Http] Gemini API HTTP error: status={e.code}, message=\"{sanitized_msg}\"")
+            print(f"[LLM Http] {self.name.title()} API HTTP error: status={e.code}, message=\"{sanitized_msg}\"")
             return None
         except urllib.error.URLError as e:
             reason_str = str(getattr(e, "reason", e))
@@ -1046,13 +1133,13 @@ class LLMHttpProvider:
             if is_timeout:
                 self.last_status = 408
                 self.last_error = f"Request timed out after {self.timeout:.1f}s"
-                print(f"[LLM Http] Gemini API request timed out after {self.timeout:.1f}s.")
+                print(f"[LLM Http] {self.name.title()} API request timed out after {self.timeout:.1f}s.")
             else:
                 self.last_status = None
                 reason_type = type(e.reason).__name__ if hasattr(e, "reason") else type(e).__name__
                 sanitized_reason = self._sanitize_error_message(str(e.reason))
                 self.last_error = f"Network connection failed: {sanitized_reason}"
-                print(f"[LLM Http] Gemini API connection error: {reason_type} ({sanitized_reason})")
+                print(f"[LLM Http] {self.name.title()} API connection error: {reason_type} ({sanitized_reason})")
             return None
         except (socket.timeout, TimeoutError):
             self.last_status = 408
@@ -1063,7 +1150,7 @@ class LLMHttpProvider:
             self.last_status = None
             sanitized_err = self._sanitize_error_message(str(e))
             self.last_error = f"{type(e).__name__}: {sanitized_err}"
-            print(f"[LLM Http] Gemini API unexpected error: {type(e).__name__} ({sanitized_err})")
+            print(f"[LLM Http] {self.name.title()} API unexpected error: {type(e).__name__} ({sanitized_err})")
             return None
 
         return None
@@ -1086,7 +1173,7 @@ class LLMAssistant:
         self,
         api_key: Optional[str] = None,
         endpoint_url: Optional[str] = None,
-        model_name: str = "gemini-1.5-flash",
+        model_name: Optional[str] = None,
         max_workers: int = 2,
         http_provider: Optional[Any] = None,
         max_history_turns: int = 20,
@@ -1433,7 +1520,7 @@ class LLMAssistant:
     ) -> VoiceAssistantResponse:
         """
         Answers a user's spoken question about IntentSense, general knowledge, or technical topics
-        using Gemini with conversation history and offline fallback.
+        using the configured remote provider (Grok preferred) with conversation history and offline fallback.
         Ensures zero-audio and zero-vision data transfer.
         """
         _assert_no_vision_payload(question, app_state_summary)
@@ -1453,8 +1540,9 @@ class LLMAssistant:
             )
 
         is_key_configured = bool(getattr(self.http_provider, "api_key", False) or getattr(self.http_provider, "is_configured", False))
-        print(f"[LLM Assistant] GEMINI_API_KEY configured: {is_key_configured}")
-        selected_provider = "Gemini" if self.has_active_remote else "Offline"
+        selected_provider = self.http_provider.name.title() if self.has_active_remote else "Offline"
+        key_label = "XAI_API_KEY" if selected_provider == "Grok" else "GEMINI_API_KEY"
+        print(f"[LLM Assistant] {key_label} configured: {is_key_configured}")
         print(f"[LLM Assistant] Selected provider: {selected_provider}")
 
         if not self.has_active_remote:
@@ -1510,14 +1598,14 @@ class LLMAssistant:
                     category=str(remote_json.get("category", "HELP")),
                     provider=self.http_provider.name,
                 )
-                print(f"[LLM Assistant] Parsed Gemini response: answer=\"{ans_text}\", topic=\"{resp.topic}\", category=\"{resp.category}\"")
+                print(f"[LLM Assistant] Parsed {selected_provider} response: answer=\"{ans_text}\", topic=\"{resp.topic}\", category=\"{resp.category}\"")
                 self._add_to_history("user", question)
                 self._add_to_history("assistant", ans_text)
                 return resp
             else:
-                print("[LLM Assistant] Gemini response missing valid answer; evaluating fallback.")
+                print(f"[LLM Assistant] {selected_provider} response missing valid answer; evaluating fallback.")
         except Exception as e:
-            print(f"[LLM Assistant] Exception querying Gemini: {type(e).__name__}; evaluating fallback.")
+            print(f"[LLM Assistant] Exception querying {selected_provider}: {type(e).__name__}; evaluating fallback.")
 
         # Graceful fallback: check if offline provider has a dedicated IntentSense answer
         offline_resp = self.offline_provider.answer_voice_question(question, app_state_summary)
@@ -1527,38 +1615,41 @@ class LLMAssistant:
             self._add_to_history("assistant", offline_resp.answer)
             return offline_resp
 
-        # For general queries, Gemini was requested but failed: surface sanitized diagnostic reason
+        # A remote provider was requested but failed: surface sanitized diagnostic reason
         last_status = getattr(self.http_provider, "last_status", None)
         last_error = getattr(self.http_provider, "last_error", None)
 
+        provider_label = "Grok" if self.http_provider.name == "grok" else "Gemini" if self.http_provider.name == "gemini" else "Remote AI"
+        api_key_name = "XAI_API_KEY" if self.http_provider.name == "grok" else "GEMINI_API_KEY"
         if last_status in (401, 403):
-            err_answer = f"Gemini API authentication failed (HTTP {last_status}). Please verify that GEMINI_API_KEY is valid."
-            err_action = "Check your GEMINI_API_KEY environment variable or run with --api-key."
+            err_answer = f"{provider_label} API authentication failed (HTTP {last_status}). Please verify that {api_key_name} is valid."
+            err_action = f"Check your {api_key_name} configuration."
         elif last_status == 404:
-            err_answer = f"Gemini model endpoint not found (HTTP 404). Please verify the model configuration."
-            err_action = "Check model name configuration in IntentSense."
+            err_answer = f"{provider_label} model endpoint not found (HTTP 404). Please verify the model configuration."
+            err_action = "Check the configured model name in IntentSense."
         elif last_status == 429:
-            err_answer = "Gemini API rate limit or quota exceeded (HTTP 429). Please wait a moment and try again."
-            err_action = "Wait for quota refresh or verify API quota limits."
+            err_answer = f"{provider_label} API rate limit or quota exceeded (HTTP 429). Please wait a moment and try again."
+            err_action = "Wait for quota refresh or verify your API account credits."
         elif last_status == 408 or (last_error and "timed out" in last_error.lower()):
-            err_answer = "Gemini API request timed out. Please check your network connection and try again."
+            err_answer = f"{provider_label} API request timed out. Please check your network connection and try again."
             err_action = "Check network connection or try asking again."
         elif last_status:
-            err_answer = f"Gemini API returned HTTP {last_status}. {last_error or ''}".strip()
-            err_action = "Check Gemini API status and connection."
+            err_answer = f"{provider_label} API returned HTTP {last_status}. {last_error or ''}".strip()
+            err_action = f"Check {provider_label} API status and connection."
         else:
-            err_answer = f"Unable to reach Gemini API. {last_error or 'Please check your internet connection.'}".strip()
+            err_answer = f"Unable to reach {provider_label} API. {last_error or 'Please check your internet connection.'}".strip()
             err_action = "Check internet connection."
+
 
         diag_resp = VoiceAssistantResponse(
             question=question,
             answer=err_answer,
             suggested_action=err_action,
-            topic="GEMINI_API_ERROR",
+            topic=f"{self.http_provider.name.upper()}_API_ERROR",
             category="ERROR",
-            provider="gemini_error",
+            provider=f"{self.http_provider.name}_error",
         )
-        print(f"[LLM Assistant] Gemini API failure diagnostic response: \"{err_answer}\" (topic=GEMINI_API_ERROR)")
+        print(f"[LLM Assistant] {provider_label} API failure diagnostic response: \"{err_answer}\" (topic={diag_resp.topic})")
         self._add_to_history("user", question)
         self._add_to_history("assistant", diag_resp.answer)
         return diag_resp

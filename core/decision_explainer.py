@@ -157,7 +157,8 @@ class DecisionExplainer:
     def provider_status(self) -> str:
         """Returns the active provider configuration status."""
         if self._llm_assistant and self._llm_assistant.has_active_remote:
-            return "ONLINE_GEMINI"
+            provider_name = getattr(self._llm_assistant.http_provider, "name", "remote").upper()
+            return f"ONLINE_{provider_name}"
         return "OFFLINE_HEURISTIC"
 
     def _compute_cache_key(

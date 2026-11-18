@@ -1086,7 +1086,7 @@ class TestVoiceConversation(unittest.TestCase):
             "Explain quantum physics in detail",
             "What is the capital of Australia?",
         ]
-        expected_msg = "General knowledge answers require an internet connection. Gemini is currently unavailable."
+        expected_msg = "General knowledge answers require an internet connection. The online AI provider is currently unavailable."
         try:
             for q in general_queries:
                 resp = assistant.answer_voice_question(q, self.app_state)
@@ -1209,7 +1209,7 @@ class TestVoiceConversation(unittest.TestCase):
             "How does reinforcement learning work?",
             "Can you explain machine learning in simple terms?",
         ]
-        expected_unavailable = "General knowledge answers require an internet connection. Gemini is currently unavailable."
+        expected_unavailable = "General knowledge answers require an internet connection. The online AI provider is currently unavailable."
         try:
             for q in learning_queries:
                 resp = assistant.answer_voice_question(q, self.app_state)
@@ -1274,15 +1274,15 @@ class TestVoiceConversation(unittest.TestCase):
 
     def test_general_question_missing_api_key_fallback(self) -> None:
         """
-        Verifies that when GEMINI_API_KEY is not configured, general knowledge questions
+        Verifies that with no remote API key, general knowledge questions
         cleanly return the offline-unavailable message.
         """
-        assistant = LLMAssistant(api_key=None, endpoint_url=None)
+        assistant = LLMAssistant(api_key="", endpoint_url="")
         try:
             self.assertFalse(assistant.has_active_remote)
             resp = assistant.answer_voice_question("What is machine learning?", self.app_state)
             self.assertEqual(resp.provider, "offline")
-            self.assertEqual(resp.answer, "General knowledge answers require an internet connection. Gemini is currently unavailable.")
+            self.assertEqual(resp.answer, "General knowledge answers require an internet connection. The online AI provider is currently unavailable.")
             self.assertEqual(resp.topic, "OFFLINE_UNAVAILABLE")
         finally:
             assistant.close()
@@ -1398,7 +1398,7 @@ class TestVoiceConversation(unittest.TestCase):
             "What is machine learning?",
             "Tell me about the Roman Empire",
         ]
-        expected_msg = "General knowledge answers require an internet connection. Gemini is currently unavailable."
+        expected_msg = "General knowledge answers require an internet connection. The online AI provider is currently unavailable."
         try:
             for q in queries:
                 resp = assistant.answer_voice_question(q, self.app_state)

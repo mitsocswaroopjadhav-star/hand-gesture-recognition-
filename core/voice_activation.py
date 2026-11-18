@@ -1176,8 +1176,13 @@ class VoiceActivationManager:
         """Dispatches question to LLMAssistant or offline provider."""
         summary = self.get_app_state_summary() if self.get_app_state_summary is not None else {}
         has_key = bool(self.llm_assistant.http_provider.api_key) if self.llm_assistant else False
-        selected_prov = "Gemini" if (self.llm_assistant and self.llm_assistant.has_active_remote) else "Offline"
-        print(f"[Voice Debug] GEMINI_API_KEY configured: {has_key}")
+        selected_prov = (
+            self.llm_assistant.http_provider.name.title()
+            if self.llm_assistant and self.llm_assistant.has_active_remote
+            else "Offline"
+        )
+        key_label = "XAI_API_KEY" if selected_prov == "Grok" else "GEMINI_API_KEY"
+        print(f"[Voice Debug] {key_label} configured: {has_key}")
         print(f"[Voice Debug] Selected provider: {selected_prov}")
         print(f"[Voice Debug] Dispatching voice QA: question=\"{question}\", provider_mode={selected_prov}")
         if self.llm_assistant is not None:

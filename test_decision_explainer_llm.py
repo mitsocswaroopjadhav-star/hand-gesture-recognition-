@@ -384,7 +384,7 @@ class TestDecisionExplainerLLM(unittest.TestCase):
 
         # Online assistant mock
         with patch.dict("os.environ", {"GEMINI_API_KEY": "dummy-key"}):
-            online_assistant = LLMAssistant()
+            online_assistant = LLMAssistant(api_key="dummy-key")
             online_explainer = DecisionExplainer(llm_assistant=online_assistant)
             self.assertEqual(online_explainer.provider_status, "ONLINE_GEMINI")
             online_explainer.close()
