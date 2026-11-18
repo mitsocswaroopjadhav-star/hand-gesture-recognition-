@@ -876,8 +876,8 @@ class OfflineRuleBasedProvider:
         print(f"[LLM Offline] Query \"{question}\" did NOT match any IntentSense offline rule; routing to general-knowledge offline-unavailable response.")
         return VoiceAssistantResponse(
             question=question,
-            answer="General knowledge answers require an internet connection. Gemini is currently unavailable.",
-            suggested_action="Connect to the internet with GEMINI_API_KEY configured for general knowledge answers.",
+            answer="General knowledge answers require an internet connection. The online AI provider is currently unavailable.",
+            suggested_action="Configure XAI_API_KEY to enable Grok for general knowledge answers.",
             topic="OFFLINE_UNAVAILABLE",
             category="OFFLINE",
             provider="offline",
@@ -1093,8 +1093,8 @@ class LLMHttpProvider:
                             return None
                     else:
                         finish_reason = candidate.get("finishReason", "UNKNOWN")
-                        print(f"[LLM Http] Gemini candidate returned no parts. Finish reason: {finish_reason}")
-                        self.last_error = f"Gemini finished without content: {finish_reason}"
+                        print(f"[LLM Http] {self.name.title()} candidate returned no parts. Finish reason: {finish_reason}")
+                        self.last_error = f"{self.name.title()} finished without content: {finish_reason}"
                         return None
                 # Parse OpenAI / Ollama response format
                 elif "choices" in data and data["choices"]:
@@ -1107,8 +1107,8 @@ class LLMHttpProvider:
                             return {"answer": cleaned, "suggested_action": "", "topic": "GENERAL", "category": "HELP"}
                         return None
                 else:
-                    print("[LLM Http] Gemini HTTP response returned no candidates or choices.")
-                    self.last_error = "Gemini response returned no candidates or choices."
+                    print(f"[LLM Http] {self.name.title()} HTTP response returned no candidates or choices.")
+                    self.last_error = f"{self.name.title()} response returned no candidates or choices."
                     return None
         except urllib.error.HTTPError as e:
             self.last_status = e.code
